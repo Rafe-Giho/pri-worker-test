@@ -1,21 +1,42 @@
 # NKS Private Worker Outbound OpenVPN 구축 가이드
 
-## 1. 목적
+## 1. 과업 개요
 
-이 문서는 아래 목표를 기준으로 한다.
+### 1.1 목표
 
-- `Private NKS worker node` 위의 Pod가 외부 인터넷/API로 나갈 때 `OpenVPN`을 반드시 경유한다.
-- OpenVPN 서버는 `Public VPC`에 둔다.
-- 구현안은 아래 3가지를 모두 다룬다.
-  - `안 1`: Private VPC의 전용 `VPN Gateway VM(Client)`가 OpenVPN에 붙고, worker subnet은 이 VM을 기본 경로로 사용
-  - `안 2`: `각 worker node`가 OpenVPN client로 직접 접속
-  - `안 4`: `각 Pod sidecar`가 OpenVPN client로 접속
+- 폐쇄망 `Worker Node`의 Pod에서 `curl google.com` 응답을 받는다.
+- 대상 환경은 `NHN testbed`, `NKS Private Zone`이다.
+- 외부 인터넷/API 통신은 `OpenVPN`을 반드시 경유하는 방식으로 검토한다.
 
-실무 권장 순서는 아래와 같다.
+### 1.2 결과물
 
-1. `안 1` 권장
-2. `안 2` 제한적으로 허용
-3. `안 4` 특정 워크로드에만 예외적으로 사용
+- 실환경 검증 완료 후 결과 메일 회신
+- 팀두레이에 아래 내용을 정리해 업로드
+  - 원리
+  - 통신 흐름
+  - 구성 방식별 장단점
+  - 적용 절차와 운영 포인트
+
+### 1.3 기한
+
+- `2026-04-07 18:00 (KST)`
+
+### 1.4 배경
+
+- Native 전환 사업에서 `인터넷이 직접 되지 않는 구간`의 외부 API 통신을 어떻게 구성할지 탐구하고 숙달하는 목적이다.
+
+### 1.5 이번 문서에서 다루는 방안
+
+- 주 방안: `Public VPC OpenVPN Server(VM) + 각 worker node에 OpenVPN client 설치`
+  - 세부 1: `NKS User Script`로 자동 설치
+  - 세부 2: node에 직접 설치
+  - 세부 3: `DaemonSet` 등 자동 설치
+- 추가 방안 1: `Public VPC OpenVPN Server(VM) + Private VPC VPN Gateway VM(Client)`
+  - 장점: 네트워크 구간 통제 가능
+  - 단점: 단일 장애지점으로 blast radius가 커질 수 있음
+- 추가 방안 2: `Pod sidecar`로 OpenVPN client 부착
+  - 장점: 외부 통신이 필요한 Pod만 적용 가능
+  - 단점: 구조가 복잡하고 보안 예외가 필요함
 
 ## 2. 전제와 권장 아키텍처
 
@@ -29,23 +50,142 @@
 - OpenVPN 서버는 Public VPC의 `private IP`로 peering 경유 접근하는 것을 권장
   - 서버가 인터넷으로 나가기만 하면 되므로, worker/client가 굳이 서버의 public IP로 붙을 필요는 없음
 
-### 2.2 실무 권장 네트워크 값 예시
-
-아래 값은 예시다. 실제 값으로 치환해서 사용한다.
+### 2.2 전체 아키텍처
 
 ```text
-PRIVATE_VPC_CIDR=10.10.0.0/16
-PUBLIC_VPC_CIDR=10.20.0.0/16
-WORKER_SUBNET_CIDR=10.10.10.0/24
-NKS_POD_CIDR=10.244.0.0/16
-NKS_SERVICE_CIDR=10.96.0.0/16
-OVPN_TUNNEL_CIDR=10.200.0.0/24
-OVPN_SERVER_IP=10.20.10.10
-OVPN_PORT=1194
-OVPN_PROTO=udp
+[Internet / External APIs]
+              ^
+              |
+[Public VPC]
++---------------------------------------------------------------+
+| Public subnet                                                 |
+|  +-----------------------------------------+                  |
+|  | OpenVPN Server VM                       |                  |
+|  | - VPN 종단                              |                  |
+|  | - 복호화 / SNAT / Internet NAT          |                  |
+|  +-----------------------------------------+                  |
+|                           |                                   |
+|                           v                                   |
+|                    Internet Gateway                           |
++---------------------------------------------------------------+
+
+[Private VPC]
++----------------------------------------------------------------------------------+
+| Private subnet (Ops / PKI)                                                       |
+|  +--------------------+                                                           |
+|  | CA Server VM       |                                                           |
+|  | - Easy-RSA         |                                                           |
+|  | - CA / CRL 관리    |                                                           |
+|  | - 번들 패키징      |                                                           |
+|  +--------------------+                                                           |
+|                                                                                  |
+| Private subnet (NKS / Egress)                                                    |
+|  +----------------------------------------------+    +----------------------+     |
+|  | NKS Cluster (Private Zone)                   |    | VPN Gateway VM       |     |
+|  | - NodeGroup-A: worker node에 client         |    | - OpenVPN Client     |     |
+|  | - NodeGroup-B: next hop = VPN Gateway VM    |    | - 추가 방안 1        |     |
+|  | - NodeGroup-C: Pod + Sidecar client         |    +----------------------+     |
+|  +----------------------------------------------+              |                  |
++----------------------------------------------------------------------------------+
+        |                                  |                     |
+        | bundle / cert / CRL              | OpenVPN tunnel      | OpenVPN tunnel
+        +-------------------------------> OpenVPN Server VM <----+
 ```
 
-### 2.3 설계 원칙
+### 2.3 왜 CA Server를 Private VPC에 두는가
+
+현재 사용할 VPC가 `Public VPC`와 `Private VPC`뿐이라면, CA 서버는 `Private VPC`에 두는 쪽이 맞다.
+
+중요한 점은 `CA Server VM은 NKS Cluster 안에 두지 않는다`는 것이다.
+
+- CA 서버는 데이터 플레인 장비가 아니라 `인증서 발급/폐기/CRL 관리`용 관리 장비다.
+- 인터넷과 직접 맞닿을 이유가 없으므로 `Public VPC`에 둘 이유가 약하다.
+- OpenVPN 서버가 침해되더라도 `CA private key`까지 같이 탈취되는 위험을 줄이려면 분리가 필요하다.
+- worker, gateway VM, sidecar용 클라이언트 번들을 내부 경로로 배포하기 쉽다.
+- 운영 접근 경로는 `사내 관리망 또는 승인된 운영 대역 -> Private VPC CA Server`로 제한하는 편이 안전하다.
+
+즉 이 문서에서는 `Public VPC = VPN 종단 / 인터넷 출구`, `Private VPC = NKS + CA + VPN Gateway + 내부 클라이언트 자산 관리`로 역할을 나눈다.
+
+실무적으로 더 좋은 구조는 `별도 관리 VPC` 또는 `오프라인 CA`지만, 현재 전제에서는 `Private VPC 배치`가 가장 현실적이다.
+
+### 2.4 구현안별 데이터 경로
+
+```text
+안 1. 주 방안 / NodeGroup-A / 각 worker node에 OpenVPN client
+
+  Pod
+   |
+  Worker Node A(Client)
+   |
+  OpenVPN tunnel
+   |
+  OpenVPN Server(Public VPC)
+   |
+  Internet / External APIs
+
+안 2. 추가 방안 1 / NodeGroup-B / Private VPC VPN Gateway VM(Client)
+
+  Pod
+   |
+  Worker Node B
+   |
+  node egress next hop = VPN Gateway VM
+   |
+  Private VPC VPN Gateway VM(Client)
+   |
+  OpenVPN tunnel
+   |
+  OpenVPN Server(Public VPC)
+   |
+  Internet / External APIs
+
+안 3. 추가 방안 2 / NodeGroup-C / Pod sidecar OpenVPN client
+
+  Pod(App + VPN Sidecar Client)
+   |
+  OpenVPN tunnel
+   |
+  OpenVPN Server(Public VPC)
+   |
+  Internet / External APIs
+```
+
+### 2.5 원리와 통신 흐름 관점
+
+결과물에는 아래 원리와 흐름을 포함해 설명하는 것을 전제로 한다.
+
+- `VPN`: 원본 패킷을 별도의 터널 인터페이스(`tun0`)로 보내고, 외부로 나갈 때 암호화된 outer packet으로 캡슐화한다.
+- `Peering`: Private VPC의 worker/gateway/Pod가 Public VPC의 OpenVPN 서버 `private IP`에 도달할 수 있게 한다.
+- `Routing`: 어느 패킷이 `eth0`로 나가고 어느 패킷이 `tun0`로 나갈지 결정한다.
+- `DNS`: `curl google.com`은 먼저 DNS 질의를 발생시키므로, Pod의 `/etc/resolv.conf`, CoreDNS, node-local DNS cache, VPC DNS 중 무엇을 쓰는지 반드시 검증해야 한다.
+- `Encryption`: OpenVPN server와 client 사이의 outer packet은 암호화되지만, 서버에서 복호화된 뒤 인터넷으로 나갈 때는 일반 IP 패킷이 된다.
+
+공통 통신 흐름은 아래처럼 이해하면 된다.
+
+```text
+Pod process
+  -> Pod network namespace
+  -> CNI datapath
+  -> DNS lookup
+     -> 보통 CoreDNS 또는 node-local DNS cache
+     -> upstream DNS가 어디로 나가는지 별도 검증 필요
+  -> worker 또는 gateway 또는 sidecar의 routing table 조회
+  -> eth0 또는 tun0 결정
+  -> OpenVPN tunnel로 보내는 경우 원본 패킷을 암호화해 outer packet 생성
+  -> Public VPC OpenVPN Server
+  -> 복호화
+  -> SNAT / MASQUERADE
+  -> Internet Gateway
+  -> 외부 DNS 또는 외부 서비스
+```
+
+구현안별로 `tun0`가 생기는 위치만 달라진다.
+
+- `NodeGroup-A / 주 방안`: `Worker Node`에 `tun0`가 생긴다.
+- `NodeGroup-B / 추가 방안 1`: `VPN Gateway VM`에 `tun0`가 생기고, 해당 node group의 외부 egress next hop은 `VPN Gateway VM`이 된다.
+- `NodeGroup-C / 추가 방안 2`: `Pod network namespace` 안에 `tun0`가 생긴다.
+
+### 2.6 설계 원칙
 
 - `OpenVPN server`는 `인터넷 NAT 출구` 역할까지 수행한다.
 - `CA 서버`는 OpenVPN 서버와 분리한다.
@@ -56,823 +196,46 @@ OVPN_PROTO=udp
 - `CRL`을 반드시 운영한다.
 - `tls-crypt`를 기본 사용한다.
   - 대규모 또는 고위험 환경이면 `tls-crypt-v2` 검토
-- `안 2`, `안 4`는 `redirect-gateway`를 서버에서 일괄 push하지 말고, `client config`에서 직접 라우팅을 제어한다.
+- `주 방안`, `추가 방안 2`는 `redirect-gateway`를 서버에서 일괄 push하지 말고, `client config`에서 직접 라우팅을 제어한다.
   - NKS 내부 대역, Service CIDR, VPC CIDR이 VPN으로 빨려 들어가면 장애 난다.
 
 ## 3. 구현안별 적합도
 
 | 구현안 | 적합도 | 핵심 판단 |
 |---|---:|---|
-| 안 1. Private VPC VPN Gateway VM(Client) | 높음 | worker를 건드리지 않고 VPC/subnet 단위로 처리 가능. 운영성이 가장 좋다. |
-| 안 2. 각 worker node에 OpenVPN client | 중 | 요구사항에는 맞지만 node OS, kubelet, image pull, DNS까지 영향받는다. 전용 node group일 때만 권장한다. |
-| 안 4. Pod sidecar OpenVPN client | 중하 | 특정 워크로드만 예외 처리할 때 유용. `NET_ADMIN`, `/dev/net/tun`, PodSecurity 예외가 필요하다. |
+| 주 방안. 각 worker node에 OpenVPN client | 높음 | 이번 과업 의도와 가장 직접적으로 맞는다. autoscale 대응은 `User Script`가 가장 현실적이다. |
+| 추가 방안 1. Private VPC VPN Gateway VM(Client) | 중상 | 네트워크 경계 통제가 쉽다. 대신 gateway 장애 시 영향 범위가 넓다. |
+| 추가 방안 2. Pod sidecar OpenVPN client | 중하 | 특정 Pod만 선택적으로 보낼 수 있다. 대신 구조와 운영이 가장 복잡하다. |
 
-## 4. 공통 준비
+## 4. 구현 부록 안내
 
-### 4.1 보안 그룹/방화벽
+- 상세 구현 절차, 명령어, 스크립트, 설정 예시는 [openvpn-nks-implementation-appendix.md](./openvpn-nks-implementation-appendix.md)에 분리했다.
+- 이 부록에는 기존 가이드의 `## 4. 공통 준비`부터 `## 9. 추가 방안 2 - Pod sidecar OpenVPN client`까지를 원문 그대로 옮겼다.
+- 명령어, 스크립트, 설정 예시는 요약하지 않고 그대로 유지했다.
 
-OpenVPN 서버 VM:
+## 5. 운영 부록 안내
 
-- inbound: `UDP/1194` from `PRIVATE_VPC_CIDR` 또는 게이트웨이/worker/pod가 있는 실제 source 대역
-- inbound: `TCP/22` from 운영 bastion
-- outbound: 외부 API 대상 포트 허용
+- 인증서 갱신, 폐기, CRL, 운영 자동화, 트러블슈팅은 [openvpn-nks-operations-appendix.md](./openvpn-nks-operations-appendix.md)에 분리했다.
+- 이 부록에는 기존 가이드의 `## 10. 인증서 갱신 / 폐기 / 교체`부터 `## 12. 트러블슈팅 체크리스트`까지를 원문 그대로 옮겼다.
+- 운영 절차와 명령어도 축약하지 않았다.
 
-VPN Gateway VM:
+## 6. 최종 권고
 
-- inbound: `WORKER_SUBNET_CIDR`에서 오는 아웃바운드 대상 트래픽 허용
-- outbound: `OVPN_SERVER_IP:1194/udp`
-
-### 4.2 NHN Cloud 네트워크 준비
-
-- Public VPC와 Private VPC 간 `Peering` 생성
-- 양쪽 VPC routing table에 상대 VPC CIDR route 추가
-  - NHN 문서 기준 한국 리전은 `추가 route 설정`이 필요
-- 게이트웨이 VM을 라우트 gateway로 쓸 경우 `source/target check` 비활성화
-- HA가 필요하면 `VIP + keepalived` 구조 검토
-
-## 5. 공통 PKI / CA 서버 구축
-
-실무 권장:
-
-- `CA 서버`는 OpenVPN 서버와 분리
-- 가능하면 `offline root / online issuing CA`가 가장 좋다
-- 본 문서는 운영 난이도를 낮추기 위해 `전용 issuing CA 1대` 기준으로 쓴다
-
-### 5.1 CA 서버 설치
-
-```bash
-sudo apt-get update
-sudo apt-get install -y easy-rsa openssl openvpn
-umask 077
-mkdir -p ~/easy-rsa
-cp -a /usr/share/easy-rsa/* ~/easy-rsa/
-cd ~/easy-rsa
-```
-
-### 5.2 Easy-RSA vars 작성
-
-`~/easy-rsa/vars`
-
-```bash
-set_var EASYRSA_ALGO "ec"
-set_var EASYRSA_CURVE "prime256v1"
-set_var EASYRSA_DIGEST "sha256"
-set_var EASYRSA_CA_EXPIRE 3650
-set_var EASYRSA_CERT_EXPIRE 397
-set_var EASYRSA_CRL_DAYS 30
-set_var EASYRSA_DN "cn_only"
-set_var EASYRSA_REQ_COUNTRY "KR"
-set_var EASYRSA_REQ_PROVINCE "Gyeonggi-do"
-set_var EASYRSA_REQ_CITY "Seongnam"
-set_var EASYRSA_REQ_ORG "ExampleCorp"
-set_var EASYRSA_REQ_EMAIL "netops@example.com"
-set_var EASYRSA_REQ_OU "Platform"
-```
-
-### 5.3 CA 생성
-
-```bash
-cd ~/easy-rsa
-./easyrsa init-pki
-./easyrsa build-ca
-```
-
-주의:
-
-- `ca.key`는 가장 중요한 키다.
-- `ca.key`는 CA 서버 밖으로 절대 복사하지 않는다.
-- `build-ca` 시 passphrase를 꼭 건다.
-
-### 5.4 서버/클라이언트 인증서 발급
-
-예시 CN 규칙:
-
-- 서버: `ovpn-public-vpc-srv-01`
-- 게이트웨이 VM: `ovpn-gw-pri-01`
-- 워커 노드: `ovpn-node-ng-a-01`
-- 사이드카 Pod: `ovpn-pod-ns1-app1-01`
-
-```bash
-cd ~/easy-rsa
-
-./easyrsa build-server-full ovpn-public-vpc-srv-01 nopass
-./easyrsa build-client-full ovpn-gw-pri-01 nopass
-./easyrsa build-client-full ovpn-node-ng-a-01 nopass
-./easyrsa build-client-full ovpn-pod-ns1-app1-01 nopass
-./easyrsa gen-crl
-
-openvpn --genkey tls-crypt ~/easy-rsa/pki/private/tls-crypt.key
-```
-
-실무 메모:
-
-- daemon용 cert는 보통 `nopass`를 쓴다.
-- 대신 `파일권한`, `배포경로`, `CRL`, `짧은 만료주기`로 보완한다.
-- 엄격한 보안정책이면 passphrase + systemd askpass/HSM 별도 설계가 필요하다.
-
-### 5.5 배포 번들 생성
-
-서버용 번들:
-
-```bash
-install -d -m 0700 ~/dist/server
-install -m 0644 ~/easy-rsa/pki/ca.crt ~/dist/server/
-install -m 0644 ~/easy-rsa/pki/issued/ovpn-public-vpc-srv-01.crt ~/dist/server/
-install -m 0600 ~/easy-rsa/pki/private/ovpn-public-vpc-srv-01.key ~/dist/server/
-install -m 0644 ~/easy-rsa/pki/crl.pem ~/dist/server/
-install -m 0600 ~/easy-rsa/pki/private/tls-crypt.key ~/dist/server/
-```
-
-클라이언트용 번들 예시:
-
-```bash
-install -d -m 0700 ~/dist/ovpn-gw-pri-01
-install -m 0644 ~/easy-rsa/pki/ca.crt ~/dist/ovpn-gw-pri-01/
-install -m 0644 ~/easy-rsa/pki/issued/ovpn-gw-pri-01.crt ~/dist/ovpn-gw-pri-01/
-install -m 0600 ~/easy-rsa/pki/private/ovpn-gw-pri-01.key ~/dist/ovpn-gw-pri-01/
-install -m 0600 ~/easy-rsa/pki/private/tls-crypt.key ~/dist/ovpn-gw-pri-01/
-```
-
-배포 원칙:
-
-- VM/node bundle은 `scp/ansible/secure bootstrap endpoint`로 배포
-- Pod sidecar bundle은 `Kubernetes Secret`으로 배포
-- `user script` 안에 PEM을 직접 하드코딩하지 않는다
-  - 비밀 유출 위험
-  - NKS user script 용량 제한
-
-## 6. 공통 OpenVPN 서버 구축
-
-### 6.1 서버 패키지 설치
-
-```bash
-sudo apt-get update
-sudo apt-get install -y openvpn iptables-persistent
-sudo install -d -m 0750 /etc/openvpn/server/pki
-```
-
-번들 복사:
-
-```bash
-sudo cp ~/dist/server/* /etc/openvpn/server/pki/
-sudo chmod 0644 /etc/openvpn/server/pki/ca.crt /etc/openvpn/server/pki/*.crt /etc/openvpn/server/pki/crl.pem
-sudo chmod 0600 /etc/openvpn/server/pki/*.key
-```
-
-### 6.2 IP forwarding
-
-`/etc/sysctl.d/99-openvpn.conf`
-
-```conf
-net.ipv4.ip_forward=1
-```
-
-적용:
-
-```bash
-sudo sysctl --system
-```
-
-### 6.3 서버 설정
-
-`/etc/openvpn/server/server.conf`
-
-```conf
-port 1194
-proto udp
-dev tun
-topology subnet
-server 10.200.0.0 255.255.255.0
-
-ca /etc/openvpn/server/pki/ca.crt
-cert /etc/openvpn/server/pki/ovpn-public-vpc-srv-01.crt
-key /etc/openvpn/server/pki/ovpn-public-vpc-srv-01.key
-crl-verify /etc/openvpn/server/pki/crl.pem
-tls-crypt /etc/openvpn/server/pki/tls-crypt.key
-
-dh none
-ecdh-curve prime256v1
-tls-version-min 1.2
-auth SHA256
-data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
-data-ciphers-fallback AES-256-CBC
-
-keepalive 10 60
-persist-key
-persist-tun
-user nobody
-group nogroup
-
-client-config-dir /etc/openvpn/server/ccd
-status /var/log/openvpn/openvpn-status.log
-log-append /var/log/openvpn/server.log
-verb 3
-explicit-exit-notify 1
-```
-
-메모:
-
-- 여기서는 `redirect-gateway`를 서버에서 일괄 push하지 않는다.
-- 클라이언트 종류별로 필요한 route가 달라서 `client config`에서 제어하는 편이 안전하다.
-
-### 6.4 서버 NAT
-
-```bash
-sudo iptables -A FORWARD -i tun0 -o eth0 -j ACCEPT
-sudo iptables -A FORWARD -i eth0 -o tun0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-sudo iptables -t nat -A POSTROUTING -s 10.200.0.0/24 -o eth0 -j MASQUERADE
-sudo netfilter-persistent save
-```
-
-`eth0`는 실제 인터넷 방향 NIC로 치환한다.
-
-### 6.5 서비스 시작
-
-```bash
-sudo systemctl enable --now openvpn-server@server
-sudo systemctl status openvpn-server@server
-```
-
-### 6.6 서버 점검
-
-```bash
-sudo ss -lunp | grep 1194
-ip addr show tun0
-sudo journalctl -u openvpn-server@server -f
-```
-
-## 7. 안 1 - Private VPC VPN Gateway VM(Client)
-
-### 7.1 적용 대상
-
-아래 조건이면 1순위로 선택한다.
-
-- 특정 worker subnet 또는 node group 전체를 OpenVPN egress로 보낼 것
-- worker node OS에는 VPN 클라이언트를 직접 넣고 싶지 않을 것
-- 운영 단순성이 중요할 것
-
-### 7.2 구조
-
-```text
-Pod -> WorkerNode -> Private VPC Route -> VPN Gateway VM(Client) -> OpenVPN Server(Public VPC) -> Internet
-```
-
-### 7.3 Gateway VM 준비
-
-```bash
-sudo apt-get update
-sudo apt-get install -y openvpn iptables-persistent
-sudo install -d -m 0750 /etc/openvpn/client/pki
-```
-
-클라이언트 번들 복사:
-
-```bash
-sudo cp ~/dist/ovpn-gw-pri-01/* /etc/openvpn/client/pki/
-sudo chmod 0644 /etc/openvpn/client/pki/ca.crt /etc/openvpn/client/pki/*.crt
-sudo chmod 0600 /etc/openvpn/client/pki/*.key
-```
-
-### 7.4 Gateway VM client 설정
-
-`/etc/openvpn/client/egress-gw.conf`
-
-```conf
-client
-dev tun
-proto udp
-remote 10.20.10.10 1194
-nobind
-persist-key
-persist-tun
-
-ca /etc/openvpn/client/pki/ca.crt
-cert /etc/openvpn/client/pki/ovpn-gw-pri-01.crt
-key /etc/openvpn/client/pki/ovpn-gw-pri-01.key
-tls-crypt /etc/openvpn/client/pki/tls-crypt.key
-
-remote-cert-tls server
-tls-version-min 1.2
-auth SHA256
-data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
-data-ciphers-fallback AES-256-CBC
-verb 3
-
-route 10.20.10.10 255.255.255.255 net_gateway
-redirect-gateway def1
-```
-
-메모:
-
-- `remote`는 가능하면 OpenVPN 서버의 `private IP`를 쓴다.
-- `route <server-ip> ... net_gateway`를 넣어 터널 endpoint가 다시 터널로 들어가지 않게 한다.
-
-### 7.5 Gateway VM forwarding / NAT
-
-`/etc/sysctl.d/99-openvpn-gw.conf`
-
-```conf
-net.ipv4.ip_forward=1
-```
-
-적용:
-
-```bash
-sudo sysctl --system
-```
-
-worker subnet에서 들어온 트래픽을 tun0로 내보내는 NAT:
-
-```bash
-sudo iptables -A FORWARD -i eth0 -o tun0 -s 10.10.10.0/24 -j ACCEPT
-sudo iptables -A FORWARD -i tun0 -o eth0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-sudo iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -o tun0 -j MASQUERADE
-sudo netfilter-persistent save
-```
-
-### 7.6 서비스 시작
-
-```bash
-sudo systemctl enable --now openvpn-client@egress-gw
-sudo systemctl status openvpn-client@egress-gw
-```
-
-### 7.7 NHN 라우팅
-
-실무 예시:
-
-- worker subnet 기본 경로를 `VPN Gateway VM` 또는 `VIP`로 보낸다
-- NHN 문서상 peering route는 `instance 또는 virtual IP`를 gateway로 지정할 수 있다
-- gateway VM을 route gateway로 쓸 때는 `source/target check`를 끈다
-
-권장:
-
-- HA가 필요하면 `keepalived + VIP`
-- worker는 `VIP`를 default route로 사용
-
-### 7.8 검증
-
-Gateway VM에서:
-
-```bash
-ip route
-ip addr show tun0
-curl -4 https://ifconfig.me
-```
-
-Pod에서:
-
-```bash
-kubectl exec -it <pod> -- curl -4 https://ifconfig.me
-kubectl exec -it <pod> -- curl -I https://www.google.com
-```
-
-## 8. 안 2 - 각 worker node에 OpenVPN client
-
-### 8.1 적용 대상
-
-- 특정 `전용 node group`만 VPN egress를 타게 할 것
-- node 단위 정책이 더 단순할 것
-- gateway VM을 따로 운영하지 않을 것
-
-비권장:
-
-- 공용 node group 전체
-- kube-system workload와 업무 workload가 섞인 node group
-
-### 8.2 핵심 주의사항
-
-- `NKS user script`는 worker node 초기화 중 root 권한으로 실행된다.
-- node 수만큼 OpenVPN 세션이 생긴다.
-- kubelet, containerd, image pull, DNS, 내부 통신에 영향이 갈 수 있다.
-- 따라서 `내부 CIDR bypass route`를 반드시 넣는다.
-
-### 8.3 인증서 배포 방식
-
-운영 권장:
-
-- user script에서 `secure bootstrap endpoint`로 node별 bundle을 fetch
-- bundle 이름은 `hostname` 또는 `nodegroup-role-index`로 매핑
-
-권장하지 않음:
-
-- PEM 파일을 user script 본문에 직접 inline
-
-### 8.4 NKS user script 예시
-
-아래는 Ubuntu worker node 기준 예시다.
-
-```bash
-#!/bin/bash
-set -euxo pipefail
-
-OVPN_SERVER_IP="10.20.10.10"
-PRIVATE_VPC_CIDR="10.10.0.0/16"
-PUBLIC_VPC_CIDR="10.20.0.0/16"
-NKS_POD_CIDR="10.244.0.0/16"
-NKS_SERVICE_CIDR="10.96.0.0/16"
-NODE_BUNDLE_URL="https://bootstrap.internal/ovpn/${HOSTNAME}.tar.gz"
-
-apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y openvpn ca-certificates curl
-
-install -d -m 0750 /etc/openvpn/client/pki
-curl -fsSL "${NODE_BUNDLE_URL}" -o /root/ovpn-node.tgz
-tar -xzf /root/ovpn-node.tgz -C /etc/openvpn/client/pki
-
-cat >/etc/openvpn/client/worker-egress.conf <<EOF
-client
-dev tun
-proto udp
-remote ${OVPN_SERVER_IP} 1194
-nobind
-persist-key
-persist-tun
-
-ca /etc/openvpn/client/pki/ca.crt
-cert /etc/openvpn/client/pki/${HOSTNAME}.crt
-key /etc/openvpn/client/pki/${HOSTNAME}.key
-tls-crypt /etc/openvpn/client/pki/tls-crypt.key
-
-remote-cert-tls server
-tls-version-min 1.2
-auth SHA256
-data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
-data-ciphers-fallback AES-256-CBC
-verb 3
-
-route-nopull
-route ${OVPN_SERVER_IP} 255.255.255.255 net_gateway
-route ${PRIVATE_VPC_CIDR%/*} 255.255.0.0 net_gateway
-route ${PUBLIC_VPC_CIDR%/*} 255.255.0.0 net_gateway
-route ${NKS_POD_CIDR%/*} 255.255.0.0 net_gateway
-route ${NKS_SERVICE_CIDR%/*} 255.255.0.0 net_gateway
-route 0.0.0.0 128.0.0.0 vpn_gateway
-route 128.0.0.0 128.0.0.0 vpn_gateway
-EOF
-
-systemctl enable openvpn-client@worker-egress
-systemctl restart openvpn-client@worker-egress
-```
-
-실무 메모:
-
-- 위 스크립트의 netmask 예시는 CIDR에 맞게 정확히 바꿔야 한다.
-- 실제 운영에서는 쉘 문자열 잘라쓰기 대신 `정확한 netmask`를 명시한다.
-
-실무에서는 아래처럼 명시값을 넣는 편이 안전하다.
-
-```conf
-route 10.20.10.10 255.255.255.255 net_gateway
-route 10.10.0.0 255.255.0.0 net_gateway
-route 10.20.0.0 255.255.0.0 net_gateway
-route 10.244.0.0 255.255.0.0 net_gateway
-route 10.96.0.0 255.255.0.0 net_gateway
-route 0.0.0.0 128.0.0.0 vpn_gateway
-route 128.0.0.0 128.0.0.0 vpn_gateway
-```
-
-### 8.5 검증
-
-worker node에서:
-
-```bash
-systemctl status openvpn-client@worker-egress
-ip route
-ip addr show tun0
-curl -4 https://ifconfig.me
-journalctl -u openvpn-client@worker-egress -f
-```
-
-Pod에서:
-
-```bash
-kubectl exec -it <pod> -- curl -4 https://ifconfig.me
-kubectl exec -it <pod> -- curl -I https://www.google.com
-```
-
-### 8.6 운영 팁
-
-- 반드시 `전용 node group`으로 격리한다.
-- cluster autoscaler를 쓴다면 신규 node도 같은 bundle fetch 규칙을 따라야 한다.
-- node certificate는 `hostname 종속` 대신 `nodegroup-role-random` 방식이 배포 자동화에는 더 낫다.
-
-## 9. 안 4 - Pod sidecar OpenVPN client
-
-### 9.1 적용 대상
-
-- 특정 namespace / 특정 app만 VPN egress가 필요
-- node 전체 라우팅을 건드리고 싶지 않음
-- PodSecurity 예외를 감수할 수 있음
-
-### 9.2 핵심 제약
-
-- sidecar는 app container와 `같은 Pod network namespace`를 쓴다.
-- 따라서 sidecar가 route를 바꾸면 app도 영향을 받는다.
-- 대신 `NET_ADMIN`, `/dev/net/tun`, hostPath, root 권한이 필요하다.
-- Pod Security Restricted/Baseline 환경에서는 막힐 수 있다.
-
-### 9.3 sidecar 이미지
-
-공식 client 전용 이미지에 과도하게 의존하지 말고, 내부 표준 이미지로 직접 빌드하는 것을 권장한다.
-
-`Dockerfile`
-
-```dockerfile
-FROM ubuntu:22.04
-
-RUN apt-get update \
- && DEBIAN_FRONTEND=noninteractive apt-get install -y \
-      openvpn iproute2 ca-certificates dumb-init \
- && rm -rf /var/lib/apt/lists/*
-
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod 0755 /entrypoint.sh
-
-ENTRYPOINT ["/usr/bin/dumb-init", "--", "/entrypoint.sh"]
-```
-
-`entrypoint.sh`
-
-```bash
-#!/bin/bash
-set -euo pipefail
-exec openvpn --config /etc/openvpn/client/client.conf
-```
-
-### 9.4 Kubernetes Secret
-
-```bash
-kubectl -n app-ns create secret generic ovpn-client-bundle \
-  --from-file=ca.crt=./ca.crt \
-  --from-file=client.crt=./ovpn-pod-ns1-app1-01.crt \
-  --from-file=client.key=./ovpn-pod-ns1-app1-01.key \
-  --from-file=tls-crypt.key=./tls-crypt.key
-```
-
-### 9.5 sidecar client 설정
-
-`client.conf`
-
-```conf
-client
-dev tun
-proto udp
-remote 10.20.10.10 1194
-nobind
-persist-key
-persist-tun
-
-ca /etc/openvpn/client/secret/ca.crt
-cert /etc/openvpn/client/secret/client.crt
-key /etc/openvpn/client/secret/client.key
-tls-crypt /etc/openvpn/client/secret/tls-crypt.key
-
-remote-cert-tls server
-tls-version-min 1.2
-auth SHA256
-data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
-data-ciphers-fallback AES-256-CBC
-verb 3
-
-route-nopull
-route 10.20.10.10 255.255.255.255 net_gateway
-route 10.10.0.0 255.255.0.0 net_gateway
-route 10.20.0.0 255.255.0.0 net_gateway
-route 10.244.0.0 255.255.0.0 net_gateway
-route 10.96.0.0 255.255.0.0 net_gateway
-route 0.0.0.0 128.0.0.0 vpn_gateway
-route 128.0.0.0 128.0.0.0 vpn_gateway
-```
-
-### 9.6 Deployment 예시
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: app-with-ovpn
-  namespace: app-ns
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: app-with-ovpn
-  template:
-    metadata:
-      labels:
-        app: app-with-ovpn
-    spec:
-      dnsPolicy: ClusterFirst
-      volumes:
-        - name: tun
-          hostPath:
-            path: /dev/net/tun
-            type: CharDevice
-        - name: ovpn-bundle
-          secret:
-            secretName: ovpn-client-bundle
-        - name: ovpn-config
-          configMap:
-            name: ovpn-client-config
-      containers:
-        - name: vpn
-          image: registry.example.com/platform/openvpn-client:1.0.0
-          securityContext:
-            runAsUser: 0
-            capabilities:
-              add: ["NET_ADMIN"]
-          volumeMounts:
-            - name: tun
-              mountPath: /dev/net/tun
-            - name: ovpn-bundle
-              mountPath: /etc/openvpn/client/secret
-              readOnly: true
-            - name: ovpn-config
-              mountPath: /etc/openvpn/client
-              readOnly: true
-        - name: app
-          image: curlimages/curl:8.7.1
-          command:
-            - /bin/sh
-            - -c
-            - |
-              until grep -q 'tun0:' /proc/net/dev; do sleep 1; done
-              tail -f /dev/null
-```
-
-메모:
-
-- 예시 app container는 `tun0`가 뜰 때까지 대기한다.
-- 실제 앱 이미지가 자체 entrypoint를 고정하고 있으면 wrapper 또는 startup script를 별도로 넣어야 한다.
-- sidecar feature를 쓰든 일반 multi-container pod를 쓰든 핵심은 `같은 Pod network namespace`를 공유한다는 점이다.
-
-### 9.7 검증
-
-```bash
-kubectl -n app-ns exec -it deploy/app-with-ovpn -c vpn -- ip route
-kubectl -n app-ns exec -it deploy/app-with-ovpn -c vpn -- ip addr show tun0
-kubectl -n app-ns exec -it deploy/app-with-ovpn -c app -- curl -4 https://ifconfig.me
-kubectl -n app-ns logs deploy/app-with-ovpn -c vpn
-```
-
-## 10. 인증서 갱신 / 폐기 / 교체
-
-### 10.1 운영 원칙
-
-- CA 만료: `5~10년`
-- 서버/게이트웨이/노드 cert: `180~397일`
-- Pod sidecar cert: `30~90일`
-- `만료 직전 갱신`보다 `사전 재발급 + 교체 + 기존 폐기` 절차를 권장
-
-### 10.2 권장 갱신 방식
-
-실무에서는 아래 방식이 가장 안전하다.
-
-1. 새 CN 또는 버전 suffix로 새 cert 발급
-   - 예: `ovpn-node-ng-a-01-2026q2`
-2. 새 bundle 배포
-3. client restart / rollout restart
-4. 접속 확인
-5. 기존 cert revoke
-6. `gen-crl`
-7. 새 `crl.pem`을 서버에 배포
-8. 서버에서 OpenVPN restart
-
-예시:
-
-```bash
-cd ~/easy-rsa
-./easyrsa build-client-full ovpn-node-ng-a-01-2026q2 nopass
-./easyrsa revoke ovpn-node-ng-a-01
-./easyrsa gen-crl
-```
-
-이 방식을 권장하는 이유:
-
-- 패키지별 Easy-RSA renewal helper 차이에 덜 민감
-- 롤백이 단순
-- 어떤 cert가 현재 운영중인지 추적이 쉽다
-
-### 10.3 인증서 폐기
-
-분실/유출 시:
-
-```bash
-cd ~/easy-rsa
-./easyrsa revoke <CN>
-./easyrsa gen-crl
-```
-
-서버에 새 CRL 배포:
-
-```bash
-scp ~/easy-rsa/pki/crl.pem ovpn-server:/tmp/crl.pem
-ssh ovpn-server 'sudo install -m 0644 /tmp/crl.pem /etc/openvpn/server/pki/crl.pem && sudo systemctl restart openvpn-server@server'
-```
-
-### 10.4 서버 인증서 교체
-
-```bash
-./easyrsa build-server-full ovpn-public-vpc-srv-01-2026q2 nopass
-```
-
-교체 순서:
-
-1. 새 cert/key 배포
-2. server.conf 파일 경로 변경 또는 symlink 교체
-3. `systemctl restart openvpn-server@server`
-4. client 재접속 확인
-5. 기존 서버 cert revoke
-6. CRL 갱신
-
-### 10.5 CA 키 유출 시
-
-이 경우는 `전체 PKI 재구축`이다.
-
-- 새 CA 생성
-- 서버 cert 재발급
-- 모든 client cert 재발급
-- 모든 bundle 재배포
-- 서버/클라이언트 순차 교체
-- 구 CA trust 제거
-
-즉시 대응해야 하는 사고다.
-
-## 11. 운영 자동화 권장
-
-### 11.1 최소 자동화 범위
-
-- cert 발급 파이프라인
-- bundle packaging
-- node/gateway bundle secure distribution
-- sidecar secret 갱신
-- CRL 배포
-- OpenVPN restart / rollout restart
-
-### 11.2 권장 파일 구조
-
-```text
-pki/
-dist/
-  server/
-  gateways/
-  nodes/
-  pods/
-inventory/
-  gateways.yml
-  nodes.yml
-manifests/
-  sidecar/
-```
-
-## 12. 트러블슈팅 체크리스트
-
-### 12.1 연결 자체가 안 될 때
-
-- `UDP/1194` 보안 그룹 확인
-- peering route 확인
-- server/client `ca/cert/key/tls-crypt` 일치 여부 확인
-- `remote-cert-tls server` 실패 여부 확인
-- `crl.pem` 때문에 차단된 것인지 확인
-
-### 12.2 연결은 되는데 인터넷이 안 될 때
-
-- 서버의 `net.ipv4.ip_forward=1`
-- 서버의 `POSTROUTING MASQUERADE`
-- gateway VM 사용 시 gateway의 forwarding/NAT
-- client route에 `OVPN_SERVER_IP via net_gateway` 예외가 있는지 확인
-
-### 12.3 NKS 내부 통신이 깨질 때
-
-- `NKS_POD_CIDR`, `NKS_SERVICE_CIDR`, `PRIVATE_VPC_CIDR`, `PUBLIC_VPC_CIDR` bypass route 확인
-- CoreDNS ClusterIP가 VPN으로 빠지지 않는지 확인
-- node/client 방식이면 kubelet/API server IP route 확인
-
-### 12.4 MTU 문제
-
-증상:
-
-- 일부 API만 timeout
-- 큰 payload에서만 실패
-
-대응:
-
-- `mssfix 1360`부터 테스트
-- 필요시 `tun-mtu` 조정
-- `tracepath`, `tcpdump -ni tun0`로 확인
-
-## 13. 최종 권고
-
-- 기본 권고안은 `안 1`
+- 과업 검증 기준 본선은 `주 방안`
+  - `NodeGroup-A`
+  - `user script` 기반 자동 설치
+  - `node별 고유 cert/key`
+- 공공기관/실운영 기준 기본 권고안은 `추가 방안 1`
   - `Public VPC OpenVPN Server`
   - `Private VPC VPN Gateway VM(Client)`
   - `worker subnet -> gateway VM` 라우팅
-- `안 2`는 반드시 `전용 node group`에만 적용
-- `안 4`는 소수 애플리케이션 예외 처리용으로만 사용
-- PKI는 `CA 분리`, `leaf cert 분리`, `CRL 운영`, `재발급 기반 갱신` 원칙으로 간다
+  - 가능하면 `Gateway VM 2대 이상 + VIP`
+- `주 방안`은 반드시 `전용 node group`에만 적용
+- `추가 방안 2`는 소수 애플리케이션 예외 처리용으로만 사용
+- PKI는 `CA 분리`, `leaf cert 분리`, `duplicate-cn 비활성`, `CRL 운영`, `재발급 기반 갱신` 원칙으로 간다
 
-## 14. 참고 문서
+
+## 7. 참고 문서
 
 - OpenVPN: [Routing all client traffic through VPN](https://openvpn.net/community-docs/routing-all-client-traffic--including-web-traffic--through-the-vpn.html)
 - OpenVPN: [OpenVPN 2.6 Manual](https://openvpn.net/community-docs/community-articles/openvpn-2-6-manual.html)
