@@ -192,10 +192,14 @@ Pod process
 - `leaf cert`는 엔티티별로 분리한다.
   - 게이트웨이 VM 1장
   - worker node 1장
-  - sidecar pod 1장
+  - sidecar는 기본 `workload / deployment` 단위 1장
+  - 더 강한 격리가 필요할 때만 `pod` 단위 1장
 - `CRL`을 반드시 운영한다.
 - `tls-crypt`를 기본 사용한다.
   - 대규모 또는 고위험 환경이면 `tls-crypt-v2` 검토
+- `NKS`가 제공하는 기본 컴포넌트와 경로는 먼저 유지한다.
+  - 예: `CoreDNS`, 기본 `dnsPolicy`, 기본 cluster DNS 경로
+  - 기본값으로 목표가 깨지는 것이 확인됐을 때만 조정한다
 - `주 방안`, `추가 방안 2`는 `redirect-gateway`를 서버에서 일괄 push하지 말고, `client config`에서 직접 라우팅을 제어한다.
   - NKS 내부 대역, Service CIDR, VPC CIDR이 VPN으로 빨려 들어가면 장애 난다.
 
@@ -212,6 +216,15 @@ Pod process
 - 상세 구현 절차, 명령어, 스크립트, 설정 예시는 [openvpn-nks-implementation-appendix.md](./openvpn-nks-implementation-appendix.md)에 분리했다.
 - 이 부록에는 기존 가이드의 `## 4. 공통 준비`부터 `## 9. 추가 방안 2 - Pod sidecar OpenVPN client`까지를 원문 그대로 옮겼다.
 - 명령어, 스크립트, 설정 예시는 요약하지 않고 그대로 유지했다.
+
+권장 읽기 / 구축 순서:
+
+1. 이 문서의 `2. 전제와 권장 아키텍처`, `3. 구현안별 적합도`를 먼저 읽는다.
+2. [openvpn-nks-implementation-appendix.md](./openvpn-nks-implementation-appendix.md)의 `4. 공통 준비`, `5. 공통 PKI / CA 서버 구축`을 수행한다.
+3. [openvpn-server-build-guide.md](./openvpn-server-build-guide.md)를 기준으로 `Public VPC OpenVPN Server`를 먼저 완성한다.
+4. 다시 [openvpn-nks-implementation-appendix.md](./openvpn-nks-implementation-appendix.md)로 돌아와 `6. 공통 OpenVPN 서버 구축`을 서버 가이드와 대조 확인한다.
+5. 그다음 `7. 주 방안`, `8. 추가 방안 1`, `9. 추가 방안 2` 중 검증 대상을 하나씩 수행한다.
+6. 마지막에 [openvpn-nks-operations-appendix.md](./openvpn-nks-operations-appendix.md)로 운영 자동화, 인증서 교체, 트러블슈팅 흐름을 정리한다.
 
 ## 5. 운영 부록 안내
 

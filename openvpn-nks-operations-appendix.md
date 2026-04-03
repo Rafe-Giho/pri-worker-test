@@ -41,7 +41,7 @@
 5. 기존 cert revoke
 6. `gen-crl`
 7. 새 `crl.pem`을 서버에 배포
-8. 서버에서 OpenVPN restart
+8. 서버에서 OpenVPN `reload-or-restart` 또는 `restart`
 
 예시:
 
@@ -57,6 +57,7 @@ cd ~/easy-rsa
 - 패키지별 Easy-RSA renewal helper 차이에 덜 민감
 - 롤백이 단순
 - 어떤 cert가 현재 운영중인지 추적이 쉽다
+- `crl.pem` 재배포와 서비스 반영 단계를 절차에 강제로 포함시키기 쉽다
 
 ### 10.3 인증서 폐기
 
@@ -74,6 +75,11 @@ cd ~/easy-rsa
 scp ~/easy-rsa/pki/crl.pem ovpn-server:/tmp/crl.pem
 ssh ovpn-server 'sudo install -m 0644 /tmp/crl.pem /etc/openvpn/server/pki/crl.pem && sudo systemctl restart openvpn-server@server'
 ```
+
+주의:
+
+- `crl.pem`은 권한 강등 이후에도 읽을 수 있게 보통 `0644`로 유지한다.
+- 반대로 서버 개인키와 `tls-crypt.key`는 계속 `0600`을 유지한다.
 
 ### 10.4 서버 인증서 교체
 
@@ -109,7 +115,7 @@ ssh ovpn-server 'sudo install -m 0644 /tmp/crl.pem /etc/openvpn/server/pki/crl.p
 
 - cert 발급 파이프라인
 - bundle packaging
-- bootstrap endpoint 또는 secure distribution endpoint
+- bootstrap endpoint 또는 Issuer API
 - node/gateway bundle secure distribution
 - sidecar secret 갱신
 - CRL 배포
@@ -142,7 +148,7 @@ manifests/
 - 권장 흐름:
   1. node 생성
   2. user script 실행
-  3. bootstrap endpoint에서 node별 bundle fetch
+  3. 고정 `Issuer API` 또는 bootstrap endpoint에서 node별 bundle fetch
   4. OpenVPN client 기동
 
 신규 `Pod sidecar`:
@@ -160,6 +166,40 @@ manifests/
 - `node`: 자동 발급 또는 사전 발급 풀 기반 자동화
 - `pod`: 기본은 workload 단위, 고보안 요구 시에만 pod 단위 자동 발급
 
+최소 실행 예시:
+
+신규 `worker node`가 Issuer API로 bundle을 받는 경우:
+
+```bash
+curl -fsS -X POST http://<ISSUER_HOST_PRIVATE_IP>:8443/v1/bootstrap/node-bundle \
+  -H "Authorization: Bearer <NODE_BOOTSTRAP_TOKEN>" \
+  -H "Content-Type: application/json" \
+  --data '{"node_id":"<NODE_ID>","node_group":"nodegroup-a","role":"worker","cluster":"nks-pri-test"}' \
+  -o /tmp/<NODE_ID>.tar.gz
+```
+
+신규 `gateway VM` bundle 발급 예시:
+
+```bash
+curl -fsS -X POST http://<ISSUER_HOST_PRIVATE_IP>:8443/v1/bootstrap/gateway-bundle \
+  -H "Authorization: Bearer <GATEWAY_BOOTSTRAP_TOKEN>" \
+  -H "Content-Type: application/json" \
+  --data '{"gateway_id":"<GATEWAY_ID>"}' \
+  -o /tmp/<GATEWAY_ID>.tar.gz
+```
+
+신규 `sidecar workload` Secret 갱신 예시:
+
+```bash
+kubectl -n <APP_NAMESPACE> delete secret ovpn-client-bundle --ignore-not-found
+kubectl -n <APP_NAMESPACE> create secret generic ovpn-client-bundle \
+  --from-file=ca.crt=./ca.crt \
+  --from-file=client.crt=./client.crt \
+  --from-file=client.key=./client.key \
+  --from-file=tls-crypt.key=./tls-crypt.key
+kubectl -n <APP_NAMESPACE> rollout restart deployment/<WORKLOAD_NAME>
+```
+
 ### 11.4 구현 흐름 예시
 
 신규 `worker node` 자동화:
@@ -167,10 +207,18 @@ manifests/
 ```text
 1. node 생성
 2. user script 시작
-3. bootstrap endpoint에서 <NODE_ID>.tar.gz 요청
+3. 고정 `Issuer API` 호출 또는 bootstrap endpoint에서 `<NODE_ID>.tar.gz` 요청
 4. bundle download / 배치
 5. openvpn-client@worker-egress 기동
 6. 접속 확인 후 운영 편입
+```
+
+실행 예시:
+
+```bash
+tar -xzf /tmp/<NODE_ID>.tar.gz -C /etc/openvpn/client/pki
+systemctl enable --now openvpn-client@worker-egress
+systemctl is-active openvpn-client@worker-egress
 ```
 
 신규 `gateway VM` 자동화:
@@ -178,9 +226,18 @@ manifests/
 ```text
 1. gateway VM 생성
 2. ovpn-gw-<id> cert/bundle 발급
-3. bootstrap endpoint 또는 ansible로 bundle 배포
+3. Issuer API, bootstrap endpoint, 또는 ansible로 bundle 배포
 4. OpenVPN client 기동
 5. 라우팅 / VIP 연결
+```
+
+실행 예시:
+
+```bash
+tar -xzf /tmp/<GATEWAY_ID>.tar.gz -C /etc/openvpn/client/pki
+systemctl enable --now openvpn-client@egress-gw
+systemctl is-active openvpn-client@egress-gw
+ip route
 ```
 
 신규 `sidecar workload` 자동화:
@@ -190,6 +247,14 @@ manifests/
 2. Kubernetes Secret 갱신
 3. deployment rollout restart
 4. sidecar 재기동 후 접속 확인
+```
+
+실행 예시:
+
+```bash
+kubectl -n <APP_NAMESPACE> rollout restart deployment/<WORKLOAD_NAME>
+kubectl -n <APP_NAMESPACE> rollout status deployment/<WORKLOAD_NAME>
+kubectl -n <APP_NAMESPACE> logs deploy/<WORKLOAD_NAME> -c vpn --tail=50
 ```
 
 ## 12. 트러블슈팅 체크리스트
@@ -205,9 +270,11 @@ manifests/
 ### 12.2 연결은 되는데 인터넷이 안 될 때
 
 - 서버의 `net.ipv4.ip_forward=1`
+- 서버 또는 gateway의 `rp_filter=2`
 - 서버의 `POSTROUTING MASQUERADE`
 - gateway VM 사용 시 gateway의 forwarding/NAT
 - client route에 `OpenVPN 서버 endpoint via net_gateway` 예외가 있는지 확인
+- `nslookup google.com`과 `curl -I https://www.google.com`을 분리해서 확인
 
 ### 12.3 NKS 내부 통신이 깨질 때
 
@@ -227,4 +294,12 @@ manifests/
 - `mssfix 1360`부터 테스트
 - 필요시 `tun-mtu` 조정
 - `tracepath`, `tcpdump -ni tun0`로 확인
+
+### 12.5 외부 DNS만 안 될 때
+
+- Pod의 `/etc/resolv.conf` 확인
+- `kubectl -n kube-system get configmap coredns -o yaml`로 upstream DNS 확인
+- `kubectl -n kube-system get pods -o wide -l k8s-app=kube-dns`로 CoreDNS가 어느 node group에 떠 있는지 확인
+- `nslookup kubernetes.default.svc.cluster.local`과 `nslookup google.com`을 구분해서 본다
+- `dnsPolicy: None` 테스트 Pod에서만 성공하면 VPN보다 `Cluster DNS 경로` 문제일 가능성이 높다
 
