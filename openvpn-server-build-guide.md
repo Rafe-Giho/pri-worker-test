@@ -92,23 +92,45 @@ sudo install -d -m 0755 /var/log/openvpn
 
 메모:
 
+- 이번 아키텍처에서는 `OpenVPN Server`만 public outbound가 가능하다고 가정하므로, 이 서버에 대해서만 온라인 `apt-get` 예시를 유지한다.
+- `CA / Bootstrap Server`, `Issuer API 역할`, `worker node`, `VPN Gateway VM`은 비인터넷 구간이므로 [openvpn-nks-implementation-appendix.md](./openvpn-nks-implementation-appendix.md)의 `4.3 비인터넷 구간 패키지 설치 원칙`을 따른다.
 - 기본 이미지에 `iptables` 명령 자체가 이미 들어 있는 경우가 많다.
 - 여기서 `iptables-persistent`를 같이 설치하는 이유는 명령 제공보다 `재부팅 후 규칙 영속화`에 가깝다.
 - 이미 `nftables`, `iptables-restore`, `cloud-init`, 별도 구성관리 도구로 규칙 영속화를 처리한다면 이 패키지는 생략할 수 있다.
 
 ### 6.2 번들 배치
 
+이번 과업에서 `server` 번들은 `CA / Bootstrap Server`의 `5.5 배포 번들 생성` 단계에서 `~/dist/server/`로 만들어진다.  
+`OpenVPN Server`에서는 먼저 이 파일들을 `~/inbox/server/`로 반입한 뒤 `/etc/openvpn/server/pki/`에 배치한다.
+
+OpenVPN Server에서 먼저 준비:
+
 ```bash
-sudo cp ~/dist/server/* /etc/openvpn/server/pki/
-sudo chmod 0644 /etc/openvpn/server/pki/ca.crt
-sudo chmod 0644 /etc/openvpn/server/pki/*.crt
-sudo chmod 0644 /etc/openvpn/server/pki/crl.pem
-sudo chmod 0600 /etc/openvpn/server/pki/*.key
+mkdir -p "$HOME/inbox/server"
+
+# 아래 5개 파일을 CA / Bootstrap Server의 ~/dist/server/ 에서
+# 현재 OpenVPN Server의 ~/inbox/server/ 로 먼저 반입한다.
+# - ca.crt
+# - ovpn-public-vpc-srv-01.crt
+# - ovpn-public-vpc-srv-01.key
+# - crl.pem
+# - tls-crypt.key
+```
+
+배치:
+
+```bash
+sudo install -m 0644 "$HOME/inbox/server/ca.crt" /etc/openvpn/server/pki/ca.crt
+sudo install -m 0644 "$HOME/inbox/server/ovpn-public-vpc-srv-01.crt" /etc/openvpn/server/pki/ovpn-public-vpc-srv-01.crt
+sudo install -m 0600 "$HOME/inbox/server/ovpn-public-vpc-srv-01.key" /etc/openvpn/server/pki/ovpn-public-vpc-srv-01.key
+sudo install -m 0644 "$HOME/inbox/server/crl.pem" /etc/openvpn/server/pki/crl.pem
+sudo install -m 0600 "$HOME/inbox/server/tls-crypt.key" /etc/openvpn/server/pki/tls-crypt.key
 ```
 
 검증:
 
 ```bash
+ls -l "$HOME/inbox/server"
 sudo ls -l /etc/openvpn/server/pki
 ```
 
@@ -953,7 +975,23 @@ logrotate 예시:
 
 ## 17. 지금 과업 기준 최소 성공 조건
 
-아래가 모두 맞아야 `Pod에서 curl google.com`이 성공한다.
+현재 문서를 그대로 따라도 `node egress`와 `pod egress`는 같은 단계가 아니다.
+
+- `node egress`
+  - OpenVPN 연결
+  - split default route
+  - node DNS uplink
+  - 서버 NAT/FORWARD
+- `pod egress`
+  - 위 `node egress` 전부
+  - `Private URI` 이미지 pull 경로
+  - `CoreDNS -> upstream DNS` 경로
+  - test Pod 스케줄 위치
+  - `NetworkPolicy` / `CNI` 영향
+
+즉, 아래가 모두 맞아야 최종적으로 `Pod에서 curl google.com`이 성공한다.
+
+### 17.1 Node egress 최소 조건
 
 - `Private VPC`와 `Public VPC` 간 peering 정상
 - client가 `OpenVPN Server private IP`로 접속 가능
@@ -962,7 +1000,25 @@ logrotate 예시:
 - 서버 `rp_filter=2`
 - 서버 `FORWARD/NAT` 정상
 - client 쪽 bypass route 정상
-- DNS 이름 해석 정상
+- node의 DNS uplink 정상
+
+### 17.2 Pod egress 추가 조건
+
+- test Pod 이미지가 node에서 정상 pull 된다
+  - `Private URI` 사용 시 `NCR SGW`, `OBS SGW`, `Private DNS` 또는 동등한 node-level name resolution 필요
+- test Pod가 의도한 node group에 실제로 스케줄된다
+- `CoreDNS`가 외부 이름을 실제로 풀 수 있다
+  - `kubernetes.default.svc.cluster.local`과 `google.com`을 분리해서 확인
+- `dnsPolicy: ClusterFirst` 기본 경로가 맞거나, 원인 분리용 test Pod에 한해 `dnsPolicy: None`으로 별도 검증한다
+- `NetworkPolicy`와 `CNI`가 외부 DNS/HTTP를 막지 않는다
+
+실무적으로는 아래 순서로 보는 것이 맞다.
+
+1. `node`에서 `curl -I https://www.google.com`
+2. node에서 `Private URI` 이미지 pull 확인
+3. `pod`에서 `nslookup kubernetes.default.svc.cluster.local`
+4. `pod`에서 `nslookup google.com`
+5. `pod`에서 `curl -I https://www.google.com`
 
 ## 18. 다음 단계
 

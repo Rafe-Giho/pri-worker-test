@@ -73,10 +73,11 @@
 +----------------------------------------------------------------------------------+
 | Private subnet (Ops / PKI)                                                       |
 |  +--------------------+                                                           |
-|  | CA Server VM       |                                                           |
+|  | CA / Bootstrap VM  |                                                           |
 |  | - Easy-RSA         |                                                           |
 |  | - CA / CRL 관리    |                                                           |
 |  | - 번들 패키징      |                                                           |
+|  | - bootstrap repo   |                                                           |
 |  +--------------------+                                                           |
 |                                                                                  |
 | Private subnet (NKS / Egress)                                                    |
@@ -92,19 +93,19 @@
         +-------------------------------> OpenVPN Server VM <----+
 ```
 
-### 2.3 왜 CA Server를 Private VPC에 두는가
+### 2.3 왜 CA / Bootstrap Server를 Private VPC에 두는가
 
-현재 사용할 VPC가 `Public VPC`와 `Private VPC`뿐이라면, CA 서버는 `Private VPC`에 두는 쪽이 맞다.
+현재 사용할 VPC가 `Public VPC`와 `Private VPC`뿐이라면, `CA / Bootstrap Server`는 `Private VPC`에 두는 쪽이 맞다.
 
-중요한 점은 `CA Server VM은 NKS Cluster 안에 두지 않는다`는 것이다.
+중요한 점은 `CA / Bootstrap Server VM은 NKS Cluster 안에 두지 않는다`는 것이다.
 
-- CA 서버는 데이터 플레인 장비가 아니라 `인증서 발급/폐기/CRL 관리`용 관리 장비다.
+- 이 서버는 데이터 플레인 장비가 아니라 `인증서 발급/폐기/CRL 관리 + bootstrap 배포`용 관리 장비다.
 - 인터넷과 직접 맞닿을 이유가 없으므로 `Public VPC`에 둘 이유가 약하다.
 - OpenVPN 서버가 침해되더라도 `CA private key`까지 같이 탈취되는 위험을 줄이려면 분리가 필요하다.
 - worker, gateway VM, sidecar용 클라이언트 번들을 내부 경로로 배포하기 쉽다.
-- 운영 접근 경로는 `사내 관리망 또는 승인된 운영 대역 -> Private VPC CA Server`로 제한하는 편이 안전하다.
+- 운영 접근 경로는 `사내 관리망 또는 승인된 운영 대역 -> Private VPC CA / Bootstrap Server`로 제한하는 편이 안전하다.
 
-즉 이 문서에서는 `Public VPC = VPN 종단 / 인터넷 출구`, `Private VPC = NKS + CA + VPN Gateway + 내부 클라이언트 자산 관리`로 역할을 나눈다.
+즉 이 문서에서는 `Public VPC = VPN 종단 / 인터넷 출구`, `Private VPC = NKS + CA/Bootstrap + VPN Gateway + 내부 클라이언트 자산 관리`로 역할을 나눈다.
 
 실무적으로 더 좋은 구조는 `별도 관리 VPC` 또는 `오프라인 CA`지만, 현재 전제에서는 `Private VPC 배치`가 가장 현실적이다.
 
@@ -158,6 +159,8 @@
 - `Peering`: Private VPC의 worker/gateway/Pod가 Public VPC의 OpenVPN 서버 `private IP`에 도달할 수 있게 한다.
 - `Routing`: 어느 패킷이 `eth0`로 나가고 어느 패킷이 `tun0`로 나갈지 결정한다.
 - `DNS`: `curl google.com`은 먼저 DNS 질의를 발생시키므로, Pod의 `/etc/resolv.conf`, CoreDNS, node-local DNS cache, VPC DNS 중 무엇을 쓰는지 반드시 검증해야 한다.
+  - 현재 `NodeGroup-A / user script` 기본안은 `split DNS`다.
+  - `openstacklocal`, `container.nhncloud.com`, `nhncloudservice.com`은 `eth0 -> Private DNS`로 보내고, 그 외 public name은 `tun0 -> 외부 DNS`로 보낸다.
 - `Encryption`: OpenVPN server와 client 사이의 outer packet은 암호화되지만, 서버에서 복호화된 뒤 인터넷으로 나갈 때는 일반 IP 패킷이 된다.
 
 공통 통신 흐름은 아래처럼 이해하면 된다.
@@ -177,6 +180,22 @@ Pod process
   -> SNAT / MASQUERADE
   -> Internet Gateway
   -> 외부 DNS 또는 외부 서비스
+```
+
+`NodeGroup-A / user script` 기준의 node DNS 흐름은 아래처럼 보는 편이 맞다.
+
+```text
+private name
+  -> systemd-resolved
+  -> eth0
+  -> Private DNS
+  -> NCR / OBS / VPC internal name resolution
+
+public name
+  -> systemd-resolved
+  -> tun0
+  -> approved external resolver
+  -> public internet name resolution
 ```
 
 구현안별로 `tun0`가 생기는 위치만 달라진다.
@@ -202,6 +221,9 @@ Pod process
   - 기본값으로 목표가 깨지는 것이 확인됐을 때만 조정한다
 - `주 방안`, `추가 방안 2`는 `redirect-gateway`를 서버에서 일괄 push하지 말고, `client config`에서 직접 라우팅을 제어한다.
   - NKS 내부 대역, Service CIDR, VPC CIDR이 VPN으로 빨려 들어가면 장애 난다.
+- 이 문서의 `worker node`, `gateway VM`, `sidecar` 방식은 모두 실무적으로 성립하는 egress 구현 방식이다.
+  - 다만 `HTTP route`만 맞추면 끝나는 것이 아니라 `DNS uplink`도 같이 설계해야 `curl google.com`까지 간다.
+  - 현재 `NodeGroup-A / user script` 운영형 기준은 `eth0=Private DNS`, `tun0=외부 DNS`의 `split DNS`다.
 
 ## 3. 구현안별 적합도
 
@@ -214,6 +236,8 @@ Pod process
 ## 4. 구현 부록 안내
 
 - 상세 구현 절차, 명령어, 스크립트, 설정 예시는 [openvpn-nks-implementation-appendix.md](./openvpn-nks-implementation-appendix.md)에 분리했다.
+- 테스트용 NKS 생성과 테스트용 Pod 검증만 빠르게 보려면 [openvpn-nks-test-guide.md](./openvpn-nks-test-guide.md)를 먼저 본다.
+- 실패 원인 분리와 점검 순서는 [openvpn-nks-troubleshooting-guide.md](./openvpn-nks-troubleshooting-guide.md)를 본다.
 - 이 부록에는 기존 가이드의 `## 4. 공통 준비`부터 `## 9. 추가 방안 2 - Pod sidecar OpenVPN client`까지를 원문 그대로 옮겼다.
 - 명령어, 스크립트, 설정 예시는 요약하지 않고 그대로 유지했다.
 
@@ -224,13 +248,13 @@ Pod process
 3. [openvpn-server-build-guide.md](./openvpn-server-build-guide.md)를 기준으로 `Public VPC OpenVPN Server`를 먼저 완성한다.
 4. 다시 [openvpn-nks-implementation-appendix.md](./openvpn-nks-implementation-appendix.md)로 돌아와 `6. 공통 OpenVPN 서버 구축`을 서버 가이드와 대조 확인한다.
 5. 그다음 `7. 주 방안`, `8. 추가 방안 1`, `9. 추가 방안 2` 중 검증 대상을 하나씩 수행한다.
-6. 마지막에 [openvpn-nks-operations-appendix.md](./openvpn-nks-operations-appendix.md)로 운영 자동화, 인증서 교체, 트러블슈팅 흐름을 정리한다.
+6. 마지막에 [openvpn-nks-operations-appendix.md](./openvpn-nks-operations-appendix.md)와 [openvpn-nks-troubleshooting-guide.md](./openvpn-nks-troubleshooting-guide.md)로 운영 자동화, 인증서 교체, 장애 대응 흐름을 정리한다.
 
 ## 5. 운영 부록 안내
 
-- 인증서 갱신, 폐기, CRL, 운영 자동화, 트러블슈팅은 [openvpn-nks-operations-appendix.md](./openvpn-nks-operations-appendix.md)에 분리했다.
-- 이 부록에는 기존 가이드의 `## 10. 인증서 갱신 / 폐기 / 교체`부터 `## 12. 트러블슈팅 체크리스트`까지를 원문 그대로 옮겼다.
-- 운영 절차와 명령어도 축약하지 않았다.
+- 인증서 갱신, 폐기, CRL, 운영 자동화는 [openvpn-nks-operations-appendix.md](./openvpn-nks-operations-appendix.md)에 분리했다.
+- 트러블슈팅은 [openvpn-nks-troubleshooting-guide.md](./openvpn-nks-troubleshooting-guide.md)에 별도 분리했다.
+- 운영 절차와 장애 대응 절차를 문서별로 나눠 유지한다.
 
 ## 6. 최종 권고
 

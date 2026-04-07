@@ -1,7 +1,8 @@
 # NKS OpenVPN 운영 부록
 
 - 이 문서는 [openvpn-nks-build-guide.md](./openvpn-nks-build-guide.md)의 운영 부록이다.
-- 기존 가이드의 `## 10. 인증서 갱신 / 폐기 / 교체`부터 `## 12. 트러블슈팅 체크리스트`까지를 원문 그대로 분리했다.
+- 기존 가이드의 `## 10. 인증서 갱신 / 폐기 / 교체`부터 `## 11. 운영 자동화 권장`까지를 분리했다.
+- 트러블슈팅은 [openvpn-nks-troubleshooting-guide.md](./openvpn-nks-troubleshooting-guide.md)로 따로 분리했다.
 - 운영 절차와 명령어는 축약하지 않았다.
 
 ## 10. 인증서 갱신 / 폐기 / 교체
@@ -171,7 +172,7 @@ manifests/
 신규 `worker node`가 Issuer API로 bundle을 받는 경우:
 
 ```bash
-curl -fsS -X POST http://<ISSUER_HOST_PRIVATE_IP>:8443/v1/bootstrap/node-bundle \
+curl -fsS --cacert /etc/ssl/certs/issuer-root-ca.pem -X POST https://issuer.internal:8443/v1/bootstrap/node-bundle \
   -H "Authorization: Bearer <NODE_BOOTSTRAP_TOKEN>" \
   -H "Content-Type: application/json" \
   --data '{"node_id":"<NODE_ID>","node_group":"nodegroup-a","role":"worker","cluster":"nks-pri-test"}' \
@@ -181,7 +182,7 @@ curl -fsS -X POST http://<ISSUER_HOST_PRIVATE_IP>:8443/v1/bootstrap/node-bundle 
 신규 `gateway VM` bundle 발급 예시:
 
 ```bash
-curl -fsS -X POST http://<ISSUER_HOST_PRIVATE_IP>:8443/v1/bootstrap/gateway-bundle \
+curl -fsS --cacert /etc/ssl/certs/issuer-root-ca.pem -X POST https://issuer.internal:8443/v1/bootstrap/gateway-bundle \
   -H "Authorization: Bearer <GATEWAY_BOOTSTRAP_TOKEN>" \
   -H "Content-Type: application/json" \
   --data '{"gateway_id":"<GATEWAY_ID>"}' \
@@ -257,49 +258,8 @@ kubectl -n <APP_NAMESPACE> rollout status deployment/<WORKLOAD_NAME>
 kubectl -n <APP_NAMESPACE> logs deploy/<WORKLOAD_NAME> -c vpn --tail=50
 ```
 
-## 12. 트러블슈팅 체크리스트
+## 12. 트러블슈팅 문서 안내
 
-### 12.1 연결 자체가 안 될 때
-
-- `UDP/<OPENVPN_SERVER_PORT>` 보안 그룹 확인
-- peering route 확인
-- server/client `ca/cert/key/tls-crypt` 일치 여부 확인
-- `remote-cert-tls server` 실패 여부 확인
-- `crl.pem` 때문에 차단된 것인지 확인
-
-### 12.2 연결은 되는데 인터넷이 안 될 때
-
-- 서버의 `net.ipv4.ip_forward=1`
-- 서버 또는 gateway의 `rp_filter=2`
-- 서버의 `POSTROUTING MASQUERADE`
-- gateway VM 사용 시 gateway의 forwarding/NAT
-- client route에 `OpenVPN 서버 endpoint via net_gateway` 예외가 있는지 확인
-- `nslookup google.com`과 `curl -I https://www.google.com`을 분리해서 확인
-
-### 12.3 NKS 내부 통신이 깨질 때
-
-- `NKS Pod CIDR`, `NKS Service CIDR`, `Private VPC CIDR`, `Public VPC CIDR` bypass route 확인
-- CoreDNS ClusterIP가 VPN으로 빠지지 않는지 확인
-- node/client 방식이면 kubelet/API server IP route 확인
-
-### 12.4 MTU 문제
-
-증상:
-
-- 일부 API만 timeout
-- 큰 payload에서만 실패
-
-대응:
-
-- `mssfix 1360`부터 테스트
-- 필요시 `tun-mtu` 조정
-- `tracepath`, `tcpdump -ni tun0`로 확인
-
-### 12.5 외부 DNS만 안 될 때
-
-- Pod의 `/etc/resolv.conf` 확인
-- `kubectl -n kube-system get configmap coredns -o yaml`로 upstream DNS 확인
-- `kubectl -n kube-system get pods -o wide -l k8s-app=kube-dns`로 CoreDNS가 어느 node group에 떠 있는지 확인
-- `nslookup kubernetes.default.svc.cluster.local`과 `nslookup google.com`을 구분해서 본다
-- `dnsPolicy: None` 테스트 Pod에서만 성공하면 VPN보다 `Cluster DNS 경로` 문제일 가능성이 높다
+- user script, bootstrap endpoint, `split DNS`, `Private URI` image pull, `CoreDNS`, `MTU` 문제는 [openvpn-nks-troubleshooting-guide.md](./openvpn-nks-troubleshooting-guide.md)에서 본다.
+- 운영 문서는 `인증서 / 자동화`, 트러블슈팅 문서는 `장애 원인 분리 / 확인 순서`에 집중하도록 분리했다.
 

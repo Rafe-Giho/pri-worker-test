@@ -925,6 +925,25 @@ Pod
 - `HTTP 경로`와 `DNS 경로`는 다를 수 있다
 - node 또는 gateway에 OpenVPN이 붙어 있어도 `CoreDNS upstream`이 닫혀 있으면 `curl google.com`은 실패한다
 - 먼저 `이름 해석 성공`, 그다음 `egress IP 확인` 순서로 검증해야 한다
+- 현재 `NodeGroup-A / worker-egress` 기본 템플릿은 `split DNS`를 전제로 한다
+  - `eth0 -> Private DNS`: `openstacklocal`, `container.nhncloud.com`, `nhncloudservice.com`
+  - `tun0 -> 외부 DNS`: 그 외 public name
+
+현재 `worker-egress` user script 기준 node DNS 흐름:
+
+```text
+private name
+  -> systemd-resolved
+  -> eth0
+  -> Private DNS
+  -> NCR / OBS / VPC internal name resolution
+
+public name
+  -> systemd-resolved
+  -> tun0
+  -> approved external resolver
+  -> public internet name resolution
+```
 
 ### 6.7.0 현재 가이드의 보장 범위
 
@@ -1196,6 +1215,8 @@ NKS_SERVICE_NETWORK="${NKS_SERVICE_NETWORK:?}"
 NKS_SERVICE_NETMASK="${NKS_SERVICE_NETMASK:?}"
 EGRESS_DNS_1="${EGRESS_DNS_1:?}"
 EGRESS_DNS_2="${EGRESS_DNS_2:-}"
+PRIVATE_DNS_SERVER="${PRIVATE_DNS_SERVER:-}"
+PRIVATE_DNS_ROUTE_DOMAINS="${PRIVATE_DNS_ROUTE_DOMAINS:-openstacklocal container.nhncloud.com nhncloudservice.com}"
 SERVICE_GATEWAY_NEXT_HOP="${SERVICE_GATEWAY_NEXT_HOP:-}"
 SERVICE_GATEWAY_BYPASS_IPS="${SERVICE_GATEWAY_BYPASS_IPS:-}"
 
@@ -1292,6 +1313,16 @@ systemctl enable --now openvpn-client@worker-egress
 sleep 5
 
 if command -v resolvectl >/dev/null 2>&1; then
+  if [ -n "${PRIVATE_DNS_SERVER}" ]; then
+    resolvectl dns eth0 "${PRIVATE_DNS_SERVER}"
+
+    route_domains=()
+    for d in ${PRIVATE_DNS_ROUTE_DOMAINS}; do
+      route_domains+=("~${d}")
+    done
+    resolvectl domain eth0 "${route_domains[@]}"
+  fi
+
   if [ -n "${EGRESS_DNS_2}" ]; then
     resolvectl dns tun0 "${EGRESS_DNS_1}" "${EGRESS_DNS_2}"
   else
@@ -1351,6 +1382,8 @@ NKS_SERVICE_NETWORK="<NKS_SERVICE_NETWORK>" \
 NKS_SERVICE_NETMASK="<NKS_SERVICE_NETMASK>" \
 EGRESS_DNS_1="<APPROVED_DNS_1>" \
 EGRESS_DNS_2="<APPROVED_DNS_2>" \
+PRIVATE_DNS_SERVER="<PRIVATE_DNS_SERVER>" \
+PRIVATE_DNS_ROUTE_DOMAINS="openstacklocal container.nhncloud.com nhncloudservice.com" \
 SERVICE_GATEWAY_NEXT_HOP="<SERVICE_GATEWAY_NEXT_HOP>" \
 SERVICE_GATEWAY_BYPASS_IPS="<SERVICE_GATEWAY_IP_1> <SERVICE_GATEWAY_IP_2>" \
 RUNTIME_BUNDLE="node-runtime-ubuntu2204-amd64.tar.gz" \
@@ -1366,16 +1399,17 @@ RUNTIME_BUNDLE="node-runtime-ubuntu2204-amd64.tar.gz" \
 - 1차는 `curl -k`로 2차와 `bootstrap-root-ca.pem`만 가져오고, 실제 bundle/runtime 다운로드부터 `--cacert`를 쓰는 구조다.
 - `RUNTIME_BUNDLE` 이름은 node OS에 맞게 맞춰야 한다. 예: `Ubuntu 22.04 -> node-runtime-ubuntu2204-amd64.tar.gz`
 - runtime bundle 설치 후 `openvpn`, `curl`, `ca-certificates`가 이미 들어왔으면 `apt-get -f install`을 더 진행하지 않는다. 일부 이미지에서 불필요한 의존성 복구가 다른 패키지까지 건드리며 실패하는 경우가 있었기 때문이다.
-- `curl google.com`까지 보려면 `HTTP route`만이 아니라 `DNS uplink`도 같이 잡아야 한다. Ubuntu `systemd-resolved` 기준으로는 `tun0`에 `DNS Servers`와 `~.` domain을 주는 방식이 가장 단순했다.
+- 운영 기준 DNS는 `split DNS`를 권장한다. `eth0`에는 `Private DNS`를 두고 `container.nhncloud.com`, `nhncloudservice.com`, `openstacklocal`을 보내고, `tun0`에는 외부 resolver를 두고 나머지 질의를 보낸다.
+- `curl google.com`까지 보려면 `HTTP route`만이 아니라 `DNS uplink`도 같이 잡아야 한다. 현재 `Ubuntu systemd-resolved` 기준 운영형 기본값은 `eth0`에 `Private DNS routed domains`, `tun0`에 외부 DNS와 `~.` domain을 두는 `split DNS`다.
 - PoC에서는 `1.1.1.1`, `8.8.8.8`로 검증할 수 있지만, 운영에서는 조직 승인 resolver 또는 VPN 뒤에서 도달 가능한 resolver를 넣는 편이 맞다.
 - `NCR`, `OBS`, 내부 artifact registry pull은 `Pod`가 아니라 `node의 kubelet/containerd`가 수행한다.
 - 운영형 기본값은 `Private DNS`로 `NCR Private Endpoint -> NCR SGW IP`, `Object Storage 도메인 -> OBS SGW IP`를 먼저 보장하는 것이다.
 - `Private DNS`가 아직 없다면 이 launcher를 먼저 적용하지 말고, `NCR/OBS image pull 경로`를 별도 문서 기준으로 먼저 정리하는 편이 맞다.
 - `SERVICE_GATEWAY_BYPASS_IPS`는 1차 해결책이 아니라, `Private URI`가 이미 `SGW IP`로 정상 해석되는데도 해당 목적지 IP가 `tun0`로 빨려 들어갈 때만 쓰는 예외 옵션이다.
 
-#### 7.5.3 NCR / OBS name resolution 확인과 임시 route 테스트
+#### 7.5.3 NCR / OBS name resolution 운영 전제와 확인
 
-`NodeGroup-A`의 `worker-egress` 검증 중 `NCR` 또는 `OBS` 이미지 pull이 timeout이면, 먼저 `Private URI`가 `SGW IP`로 정상 해석되는지부터 본다.
+`NodeGroup-A`의 `worker-egress` 검증 중 `NCR` 또는 `OBS` 이미지 pull이 필요하면, 먼저 `Private URI`가 `SGW IP`로 정상 해석되는지부터 본다.
 
 예시:
 
@@ -1389,32 +1423,13 @@ getent hosts kr1-api-object-storage.nhncloudservice.com
 - `Private DNS`를 먼저 구성해 아래 두 이름이 각 `SGW IP`로 풀리게 한다.
   - `private-<REGISTRY_ID>-kr1-registry.container.nhncloud.com -> <NCR_SGW_IP>`
   - `kr1-api-object-storage.nhncloudservice.com -> <OBS_SGW_IP>`
+- `worker-egress` 템플릿은 `split DNS` 기준이므로, 정상이라면 `resolvectl query private-...`가 `link: eth0`로 보여야 한다.
 - 이렇게 구성했다면 node user script에는 추가 route 예외가 없어도 된다. `PRIVATE_VPC_NETWORK` bypass route가 이미 `SGW IP`를 `eth0`로 유지하기 때문이다.
-
-그 다음에도 `dial tcp 10.x.x.x:443: i/o timeout`이 계속 나면 그때만 임시 route 예외를 본다.
-
-```bash
-sudo ip route replace 10.165.162.25/32 via 172.16.200.60 dev eth0
-sudo ip route flush cache
-ip route show 10.165.162.25/32
-ip route get 10.165.162.25
-curl -kI --max-time 10 https://private-c0978417-kr1-registry.container.nhncloud.com/v2/
-```
-
-원복:
-
-```bash
-sudo ip route del 10.165.162.25/32 via 172.16.200.60 dev eth0 || true
-sudo ip route flush cache
-ip route get 10.165.162.25
-```
 
 메모:
 
-- 위 예시는 `현재 node`에만 임시 적용한다.
-- 재부팅, 네트워크 재구성, `openvpn-client@worker-egress` 재기동 후에는 다시 사라질 수 있다.
 - `Private URI`가 `SGW IP`로 풀리지 않는다면 route보다 name resolution을 먼저 고쳐야 한다.
-- 임시 route로만 pull이 풀리면, 그 IP 또는 관련 서비스 게이트웨이 대역을 `SERVICE_GATEWAY_BYPASS_IPS` 또는 정식 route 예외에 반영한다.
+- timeout, `link: tun0`, 임시 route 예외 같은 장애 처리 흐름은 [openvpn-nks-troubleshooting-guide.md](./openvpn-nks-troubleshooting-guide.md)에서 본다.
 
 검증:
 
