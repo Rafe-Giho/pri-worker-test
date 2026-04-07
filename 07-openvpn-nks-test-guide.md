@@ -1,12 +1,20 @@
-# NKS OpenVPN 테스트 가이드
+# 07. NKS OpenVPN 테스트 가이드
 
-이 문서는 `주 방안 / NodeGroup-A / user script` 기준으로, **테스트용 NKS 생성과 테스트용 Pod 검증**만 따로 정리한 문서다.
+이 문서는 현재 표준 구성인 `NodeGroup-A / worker-egress user script / full-auto Issuer API` 기준으로, **개인 검증용 NKS 생성과 node / pod 검증**만 따로 정리한 문서다.
+
+표기 원칙:
+
+- 이 문서는 다른 문서와 달리 `실환경 예시` 비중이 높다
+- 운영 표준은 `01`, `02`, `04`, `05`, `06` 문서를 우선 본다
+- 이 문서는 마지막에 실제 검증 절차를 재현할 때 참고한다
 
 범위:
 
 - `Private NKS` 생성
 - `NodeGroup-A`에 OpenVPN client 자동 설치
+- `Issuer API`를 통한 worker cert 자동 발급
 - `node egress` 검증
+- scale-out 시 자동 발급 재검증
 - 테스트용 Pod 배포
 - `pod DNS`, `pod curl google.com` 검증
 
@@ -20,21 +28,22 @@
 
 상세 원문은 아래 문서를 기준으로 한다.
 
-- [openvpn-nks-build-guide.md](./openvpn-nks-build-guide.md)
-- [openvpn-nks-implementation-appendix.md](./openvpn-nks-implementation-appendix.md)
-- [openvpn-server-build-guide.md](./openvpn-server-build-guide.md)
-- [openvpn-nks-operations-appendix.md](./openvpn-nks-operations-appendix.md)
-- [openvpn-nks-troubleshooting-guide.md](./openvpn-nks-troubleshooting-guide.md)
+- [01-openvpn-nks-build-guide.md](./01-openvpn-nks-build-guide.md)
+- [02-openvpn-nks-implementation-appendix.md](./02-openvpn-nks-implementation-appendix.md)
+- [03-openvpn-server-build-guide.md](./03-openvpn-server-build-guide.md)
+- [05-openvpn-nks-operations-appendix.md](./05-openvpn-nks-operations-appendix.md)
+- [06-openvpn-nks-troubleshooting-guide.md](./06-openvpn-nks-troubleshooting-guide.md)
 
 ## 1. 시작 전 완료 조건
 
 아래는 **클러스터 만들기 전에** 끝나 있어야 한다.
 
 1. `Public VPC OpenVPN Server` 구축 완료
-2. `CA / Bootstrap Server` 구축 완료
-3. node runtime bundle, worker bundle, bootstrap endpoint 준비 완료
+2. `CA / Bootstrap / Issuer API` 구축 완료
+3. `worker-egress-bootstrap.sh`가 최신 full-auto 템플릿으로 bootstrap 서버에 재배포 완료
 4. `Public VPC`와 `Private VPC` peering 및 route 완료
-5. `Private NKS`에서 test image를 pull할 계획이면 `Private DNS` 완료
+5. `CA / Bootstrap / Issuer` 서버 보안그룹에 `TCP/443`, `TCP/8443` inbound 허용 완료
+6. `Private NKS`에서 test image를 pull할 계획이면 `Private DNS` 완료
 
 `Private DNS`를 쓰는 경우 최소 보장:
 
@@ -46,7 +55,7 @@
 - test Pod 이미지 pull은 `Pod`가 아니라 `node의 kubelet/containerd`가 수행한다.
 - 따라서 `hostAliases`로는 image pull 문제를 해결할 수 없다.
 
-## 2. 테스트용 NKS 생성 기준
+## 2. 현재 표준 테스트 구성
 
 이번 테스트는 `NodeGroup-A`만 쓴다.
 
@@ -54,8 +63,9 @@
 
 - `Private NKS`
 - 전용 node group 1개
-  - 예: `plain-vpn-client`
+  - 현재 예시: `default-worker`
 - 초기 node 수: `1`
+- 가능하면 `max node 수`를 `2` 이상으로 두고 scale-out도 같이 확인
 - 다른 workload와 섞지 않음
 
 이유:
@@ -70,21 +80,27 @@
 전제:
 
 - `CA / Bootstrap Server`에 `worker-egress-bootstrap.sh`가 이미 배치돼 있어야 한다.
-- 상세 내용은 [openvpn-nks-implementation-appendix.md](./openvpn-nks-implementation-appendix.md)의 `7.5.1`을 따른다.
+- 상세 내용은 [02-openvpn-nks-implementation-appendix.md](./02-openvpn-nks-implementation-appendix.md)의 `7.5.1`을 따른다.
 - fresh node 기준으로 `bootstrap-root-ca.pem`은 2차 스크립트가 먼저 받아온다.
 - 2차 스크립트를 다시 올릴 때는 `sudo rm -f /srv/bootstrap/ovpn/packages/worker-egress-bootstrap.sh` 후 같은 경로에 다시 `tee`로 배치하면 된다.
+- `Issuer API` 기준으로는 2차가 공용 템플릿이고, 실제 환경값과 metadata 값은 1차 launcher가 넘긴다.
+- 현재 자동 발급 흐름은 `Basic Auth -> /v1/bootstrap/node-token -> 1회성 token -> /v1/bootstrap/node-bundle` 2단계다.
 
-NKS node group에 넣는 launcher 예시:
+템플릿:
 
 ```bash
 #!/bin/bash
 set -euxo pipefail
 exec > >(tee -a /var/log/ovpn-user-script.log) 2>&1
 
-BOOTSTRAP_IP="172.16.200.44"
-BOOTSTRAP_USER="bootstrap"
+BOOTSTRAP_IP="<BOOTSTRAP_IP>"
+BOOTSTRAP_USER="<BOOTSTRAP_USER>"
 BOOTSTRAP_PASSWORD="<BOOTSTRAP_PASSWORD>"
 BOOTSTRAP_BASE_URL="https://${BOOTSTRAP_IP}/ovpn"
+NODE_ID="$(hostname -s)"
+METADATA_INSTANCE_ID="$(cat /var/lib/cloud/data/instance-id 2>/dev/null || hostname -s)"
+METADATA_LOCAL_HOSTNAME="$(hostname -s)"
+METADATA_PRIVATE_IP="$(hostname -I | awk '{print $1}')"
 
 curl -k -fsSL -u "${BOOTSTRAP_USER}:${BOOTSTRAP_PASSWORD}" \
   -o /var/tmp/worker-egress-bootstrap.sh \
@@ -95,10 +111,16 @@ chmod 0700 /var/tmp/worker-egress-bootstrap.sh
 BOOTSTRAP_IP="${BOOTSTRAP_IP}" \
 BOOTSTRAP_USER="${BOOTSTRAP_USER}" \
 BOOTSTRAP_PASSWORD="${BOOTSTRAP_PASSWORD}" \
-NODE_ID="ovpn-node-ng-a-01" \
+NODE_ID="${NODE_ID}" \
+NODE_GROUP="<NODE_GROUP>" \
+CLUSTER_NAME="<CLUSTER_NAME>" \
+NODE_ROLE="worker" \
+METADATA_INSTANCE_ID="${METADATA_INSTANCE_ID}" \
+METADATA_LOCAL_HOSTNAME="${METADATA_LOCAL_HOSTNAME}" \
+METADATA_PRIVATE_IP="${METADATA_PRIVATE_IP}" \
 OPENVPN_SERVER_IP="<OPENVPN_SERVER_PRIVATE_IP>" \
-OPENVPN_SERVER_PORT="1194" \
-OPENVPN_PROTO="udp" \
+OPENVPN_SERVER_PORT="<OPENVPN_SERVER_PORT>" \
+OPENVPN_PROTO="<OPENVPN_PROTO>" \
 PRIVATE_VPC_NETWORK="<PRIVATE_VPC_NETWORK>" \
 PRIVATE_VPC_NETMASK="<PRIVATE_VPC_NETMASK>" \
 PUBLIC_VPC_NETWORK="<PUBLIC_VPC_NETWORK>" \
@@ -107,9 +129,62 @@ NKS_POD_NETWORK="<NKS_POD_NETWORK>" \
 NKS_POD_NETMASK="<NKS_POD_NETMASK>" \
 NKS_SERVICE_NETWORK="<NKS_SERVICE_NETWORK>" \
 NKS_SERVICE_NETMASK="<NKS_SERVICE_NETMASK>" \
-EGRESS_DNS_1="<APPROVED_DNS_1>" \
-EGRESS_DNS_2="<APPROVED_DNS_2>" \
+EGRESS_DNS_1="<EGRESS_DNS_1>" \
+EGRESS_DNS_2="<EGRESS_DNS_2>" \
 PRIVATE_DNS_SERVER="<PRIVATE_DNS_SERVER>" \
+PRIVATE_DNS_ROUTE_DOMAINS="openstacklocal container.nhncloud.com nhncloudservice.com" \
+SERVICE_GATEWAY_NEXT_HOP="" \
+SERVICE_GATEWAY_BYPASS_IPS="" \
+RUNTIME_BUNDLE="node-runtime-ubuntu2204-amd64.tar.gz" \
+/var/tmp/worker-egress-bootstrap.sh
+```
+
+실환경 예시:
+
+```bash
+#!/bin/bash
+set -euxo pipefail
+exec > >(tee -a /var/log/ovpn-user-script.log) 2>&1
+
+BOOTSTRAP_IP="172.16.200.44"
+BOOTSTRAP_USER="bootstrap"
+BOOTSTRAP_PASSWORD="tlsrlgh07"
+BOOTSTRAP_BASE_URL="https://${BOOTSTRAP_IP}/ovpn"
+NODE_ID="$(hostname -s)"
+METADATA_INSTANCE_ID="$(cat /var/lib/cloud/data/instance-id 2>/dev/null || hostname -s)"
+METADATA_LOCAL_HOSTNAME="$(hostname -s)"
+METADATA_PRIVATE_IP="$(hostname -I | awk '{print $1}')"
+
+curl -k -fsSL -u "${BOOTSTRAP_USER}:${BOOTSTRAP_PASSWORD}" \
+  -o /var/tmp/worker-egress-bootstrap.sh \
+  "${BOOTSTRAP_BASE_URL}/packages/worker-egress-bootstrap.sh"
+
+chmod 0700 /var/tmp/worker-egress-bootstrap.sh
+
+BOOTSTRAP_IP="${BOOTSTRAP_IP}" \
+BOOTSTRAP_USER="${BOOTSTRAP_USER}" \
+BOOTSTRAP_PASSWORD="${BOOTSTRAP_PASSWORD}" \
+NODE_ID="${NODE_ID}" \
+NODE_GROUP="default-worker" \
+CLUSTER_NAME="ta-sgh-pri-cls" \
+NODE_ROLE="worker" \
+METADATA_INSTANCE_ID="${METADATA_INSTANCE_ID}" \
+METADATA_LOCAL_HOSTNAME="${METADATA_LOCAL_HOSTNAME}" \
+METADATA_PRIVATE_IP="${METADATA_PRIVATE_IP}" \
+OPENVPN_SERVER_IP="192.168.200.25" \
+OPENVPN_SERVER_PORT="1194" \
+OPENVPN_PROTO="udp" \
+PRIVATE_VPC_NETWORK="172.16.0.0" \
+PRIVATE_VPC_NETMASK="255.255.0.0" \
+PUBLIC_VPC_NETWORK="192.168.200.0" \
+PUBLIC_VPC_NETMASK="255.255.255.0" \
+NKS_POD_NETWORK="10.100.0.0" \
+NKS_POD_NETMASK="255.255.0.0" \
+NKS_SERVICE_NETWORK="10.254.0.0" \
+NKS_SERVICE_NETMASK="255.255.0.0" \
+EGRESS_DNS_1="1.1.1.1" \
+EGRESS_DNS_2="8.8.8.8" \
+PRIVATE_DNS_SERVER="172.16.0.105" \
 PRIVATE_DNS_ROUTE_DOMAINS="openstacklocal container.nhncloud.com nhncloudservice.com" \
 SERVICE_GATEWAY_NEXT_HOP="" \
 SERVICE_GATEWAY_BYPASS_IPS="" \
@@ -123,6 +198,7 @@ RUNTIME_BUNDLE="node-runtime-ubuntu2204-amd64.tar.gz" \
 - 따라서 `NCR/OBS`용 `/etc/hosts` fallback은 넣지 않는다.
 - 2차 스크립트는 `dpkg -i` 후 `openvpn`, `curl`, `ca-certificates`가 이미 설치됐으면 `apt-get -f install`을 더 진행하지 않는다.
 - 운영형 DNS는 `eth0=Private DNS`, `tun0=외부 DNS`로 split DNS를 전제로 한다.
+- 이 launcher 예시는 현재 검증 완료된 실환경 값을 그대로 넣은 버전이다.
 
 ## 4. Node egress 검증
 
@@ -150,6 +226,33 @@ curl --max-time 10 https://ifconfig.me
 
 - 여기까지는 `node egress` 성공이다.
 - 아직 `pod egress` 성공을 뜻하지는 않는다.
+
+추가로 자동발급 경로를 바로 보려면:
+
+```bash
+sudo tail -n 200 /var/log/ovpn-user-script.log
+```
+
+성공 기준:
+
+- `node-token` 요청 성공
+- `node-bundle` 요청 성공
+- `/etc/openvpn/client/pki` 아래에 `ca.crt`, `client.crt`, `client.key`, `tls-crypt.key` 생성
+
+## 4.1 scale-out 자동발급 재검증
+
+현재 표준 구성에서는 새 node scale-out 시에도 같은 흐름으로 자동발급이 일어나야 한다.
+
+확인 포인트:
+
+1. node 수를 `1 -> 2` 이상으로 늘린다
+2. 새 node에서 `/var/log/ovpn-user-script.log` 확인
+3. `openvpn-client@worker-egress`, `tun0`, `curl ifconfig.me` 확인
+
+핵심 판단:
+
+- 같은 node reboot은 기존 cert 재사용
+- 새 node scale-out은 `node-token -> node-bundle` 재수행
 
 ## 5. 테스트용 Pod 이미지 준비
 
@@ -234,7 +337,7 @@ kubectl exec -n egress-test -it pod-egress-test -- curl https://ifconfig.me
 
 ## 8. 실패 시 참고 문서
 
-- `ImagePullBackOff`, `split DNS`, `CoreDNS`, `pod DNS`, `MTU`, `route` 문제는 [openvpn-nks-troubleshooting-guide.md](./openvpn-nks-troubleshooting-guide.md)에서 본다.
+- `ImagePullBackOff`, `split DNS`, `CoreDNS`, `pod DNS`, `MTU`, `route` 문제는 [06-openvpn-nks-troubleshooting-guide.md](./06-openvpn-nks-troubleshooting-guide.md)에서 본다.
 - 이 테스트 문서에서는 `node -> image pull -> pod DNS -> pod HTTP` 순서만 유지하고, 실패 원인 분리는 별도 문서로 처리한다.
 
 ## 9. 이 문서의 해석 기준

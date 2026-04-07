@@ -1,8 +1,24 @@
-# NKS OpenVPN 구현 부록
+# 02. NKS OpenVPN 구현 부록
 
-- 이 문서는 [openvpn-nks-build-guide.md](./openvpn-nks-build-guide.md)의 상세 구현 부록이다.
-- 기존 가이드의 `## 4. 공통 준비`부터 `## 9. 추가 방안 2 - Pod sidecar OpenVPN client`까지를 원문 그대로 분리했다.
-- 명령어, 스크립트, 설정 예시는 축약하지 않았다.
+- 이 문서는 [01-openvpn-nks-build-guide.md](./01-openvpn-nks-build-guide.md)의 상세 구현 문서다.
+- 현재 기준 표준 경로는 `NodeGroup-A / worker-egress user script / full-auto Issuer API`다.
+- 이 문서는 공통 준비, CA/Bootstrap/bootstrap endpoint, OpenVPN Server, Issuer API, worker 자동발급, gateway VM, sidecar 순서로 읽도록 유지한다.
+- 명령어, 스크립트, 설정 예시는 축약하지 않고 운영형 템플릿 기준으로 남긴다.
+
+표기 원칙:
+
+- `템플릿`: 다른 환경에도 그대로 가져갈 수 있는 일반형 예시
+- `실환경 예시`: 현재 `ta-sgh-*` 환경에서 실제 검증한 값
+- 운영형 절차는 `템플릿`을 기준으로 설명하고, 필요 시 바로 아래에 `실환경 예시`를 둔다
+
+빠른 읽기 순서:
+
+1. `4장` 공통 준비
+2. `5장` CA / Bootstrap 준비
+3. `6장` OpenVPN Server 검증
+4. `6.8`과 [04-openvpn-issuer-api-guide.md](./04-openvpn-issuer-api-guide.md)로 Issuer API 구축
+5. `7.5`와 `7.7`로 `NodeGroup-A` 자동발급 검증
+6. 필요 시 `8장`, `9장`으로 `Gateway VM`, `sidecar` 확장
 
 ## 4. 공통 준비
 
@@ -13,6 +29,12 @@ OpenVPN 서버 VM:
 - inbound: `UDP/<OPENVPN_SERVER_PORT>` from `Private VPC에서 OpenVPN client가 나오는 실제 source 대역`
 - inbound: `TCP/22` from 승인된 운영 접근 대역
 - outbound: 외부 API 대상 포트 허용
+
+CA / Bootstrap / Issuer 서버:
+
+- inbound: `TCP/443` from `worker node / gateway / 운영자` source 대역
+- inbound: `TCP/8443` from `Issuer API`를 호출할 `worker node` 또는 해당 nodegroup source 대역
+- outbound: `OpenVPN Server`, `NCR/OBS`, 운영 대상 저장소로 필요한 포트 허용
 
 VPN Gateway VM:
 
@@ -25,7 +47,8 @@ VPN Gateway VM:
 2. source는 `Private VPC` 전체보다는 실제 `OpenVPN client가 나오는 subnet` 또는 `gateway subnet`으로 좁힌다.
 3. 운영 접속이 필요하면 `TCP/22`는 승인된 운영 접근 대역만 연다.
 4. `VPN Gateway VM` 방식이면 gateway VM 보안그룹에서 `worker subnet -> gateway` 경로를 연다.
-5. sidecar 방식은 별도 보안그룹보다 `OpenVPN Server`와의 L3 경로, Pod egress 정책, 네임스페이스 정책을 같이 본다.
+5. `Issuer API` 자동 발급을 쓰면 `CA / Bootstrap / Issuer` 서버에서 `TCP/8443` inbound를 nodegroup source 대역 기준으로 연다.
+6. sidecar 방식은 별도 보안그룹보다 `OpenVPN Server`와의 L3 경로, Pod egress 정책, 네임스페이스 정책을 같이 본다.
 
 최소 검증:
 
@@ -465,57 +488,23 @@ sudo cp "$HOME/inbox/node-runtime-ubuntu2204-amd64.tar.gz" /srv/bootstrap/ovpn/p
 - 작업용 반입 경로: `~/inbox/node-runtime-ubuntu2204-amd64.tar.gz`
 - bootstrap endpoint 최종 경로: `/srv/bootstrap/ovpn/packages/node-runtime-ubuntu2204-amd64.tar.gz`
 
-이후 worker node / gateway VM은 `5.11`과 `7.5`, `8.5` 예시처럼 아래 URL에서 이 파일을 받는다.
+이후 worker node / gateway VM은 `7.5`, `8.5` 예시처럼 아래 URL에서 이 파일을 받는다.
 
 - `https://<BOOTSTRAP_ENDPOINT_PRIVATE_IP>/ovpn/packages/node-runtime-ubuntu2204-amd64.tar.gz`
 
-### 5.8 bootstrap endpoint / 번들 배포 구조
+### 5.8 bootstrap endpoint 구현 예시
 
-이 문서에서 말하는 `bootstrap endpoint`는 `CA / Bootstrap Server`에 같이 올려 두는 `고정 배포 엔드포인트`를 뜻한다. 새 node 또는 gateway는 여기서 client bundle을 내려받는다.
+가장 단순한 구현은 `Private VPC`의 `CA 서버`에 `nginx`를 같이 두고, worker/gateway가 공통으로 참조할 `bootstrap endpoint`를 두는 방식이다.
 
-중요:
+현재 worker 표준에서 이 endpoint의 역할은 아래처럼 나뉜다.
 
-- `node마다 새로운 endpoint`를 만드는 구조가 아니다
-- endpoint는 보통 `1개` 또는 `HA로 2개 이상`의 `고정 URL`로 운영한다
-- 새로 만들어지는 것은 `endpoint`가 아니라 `개체별 cert/key와 bundle`이다
-
-권장 구조:
-
-```text
-CA / Bootstrap Server
-  -> cert 발급 / revoke / CRL 생성
-  -> bundle packaging
-  -> bootstrap repository 제공
-
-Worker Node / Gateway VM
-  -> 고정 bootstrap endpoint 접속
-  -> 자기 식별값에 맞는 bundle download
-  -> /etc/openvpn/client/pki 배치
-  -> OpenVPN client 기동
-```
-
-권장 구현:
-
-- 정적 bootstrap repo 예시: `https://<BOOTSTRAP_ENDPOINT_PRIVATE_IP>/ovpn/issued/...`
-- 자동 발급 API 예시: `https://issuer.internal:8443/v1/bootstrap/...`
-- 접근 제한:
-  - Private VPC 내부 접근만 허용
-  - nodegroup source 대역 제한
-  - 정적 repo는 `PoC` 기준 `Basic Auth + HTTPS`
-  - 운영은 `mTLS`, `signed URL`, `짧은 만료 토큰` 중 하나로 강화
-- bundle 매핑:
-  - `nodegroup-role-random`
-  - 또는 `gateway-name`
-
-현재 문서의 상태:
-
-- `bootstrap endpoint 방식`까지는 설계에 포함한다
-- 현재 문서 전제에서는 `CA / Bootstrap Server`에 실제 bootstrap endpoint를 같이 구현한다
-- 운영형으로 가려면 `배포 서버/저장소`, `인증 방식`, `bundle 업로드 절차`를 추가 구현해야 한다
-
-### 5.9 bootstrap endpoint 구현 예시
-
-가장 단순한 구현은 `Private VPC`의 `CA 서버`에 `nginx`를 같이 두고, `정적 bundle 저장소`처럼 쓰는 방식이다.
+- 필수:
+  - `/ovpn/packages/bootstrap-root-ca.pem`
+  - `/ovpn/packages/worker-egress-bootstrap.sh`
+  - `/ovpn/packages/node-runtime-ubuntu2204-amd64.tar.gz`
+- 선택:
+  - `/ovpn/issued/`
+  - 정적 bundle fallback, gateway/sidecar 확장, 수동 분석용으로만 남겨둘 수 있다
 
 PoC 기준 구성:
 
@@ -651,6 +640,8 @@ sudo systemctl restart nginx
 - 운영은 `mTLS` 또는 `짧은 만료 토큰` 기반으로 전환
 - 현재 과업 전제는 `CA 서버 = bootstrap endpoint` 동거 구성이다
 - 장기 운영에서 보안 분리가 더 중요해지면 그때 `CA 서버`와 `bootstrap endpoint`를 분리 검토한다
+- 현재 worker 표준은 `정적 bundle download`가 아니라 `packages endpoint + Issuer API` 조합이다
+- 따라서 `/ovpn/packages/`는 현재 필수 경로지만, `/ovpn/issued/`는 fallback 또는 확장 경로로만 보면 된다
 
 TLS / 이름해석 전제:
 
@@ -666,103 +657,11 @@ TLS / 이름해석 전제:
 - user script의 `BOOTSTRAP_BASE_URL`도 `https://bootstrap.internal/ovpn`처럼 바꾸면 된다.
 - 다만 현재 과업은 DNS 의존도를 줄이기 위해 `private IP 직접 접근`을 기본값으로 둔다.
 
-### 5.11 bootstrap 저장소 업로드 예시
-
-`5.9`에서 nginx 설치, TLS 파일 배치, 설정 파일 생성, 기동까지 끝낸 뒤 정적 콘텐츠를 업로드한다.
-
-노드 번들을 bootstrap endpoint 경로에 배치:
-
-```bash
-sudo install -d -m 0750 /srv/bootstrap/ovpn/issued
-sudo install -d -m 0750 /srv/bootstrap/ovpn/packages
-
-sudo install -o www-data -g www-data -m 0644 \
-  "$HOME/dist/nodes/ovpn-node-ng-a-01.tar.gz" \
-  /srv/bootstrap/ovpn/issued/ovpn-node-ng-a-01.tar.gz
-
-sudo install -o www-data -g www-data -m 0644 \
-  "$HOME/dist/gateways/ovpn-gw-pri-01.tar.gz" \
-  /srv/bootstrap/ovpn/issued/ovpn-gw-pri-01.tar.gz
-
-sudo install -o www-data -g www-data -m 0644 \
-  "$HOME/inbox/node-runtime-ubuntu2204-amd64.tar.gz" \
-  /srv/bootstrap/ovpn/packages/node-runtime-ubuntu2204-amd64.tar.gz
-```
-
-활성화 및 점검:
-
-```bash
-sudo nginx -t
-sudo systemctl restart nginx
-
-curl --cacert "$HOME/dist/bootstrap-https/bootstrap-root-ca.pem" -u bootstrap:'<BOOTSTRAP_PASSWORD>' \
-  https://<BOOTSTRAP_ENDPOINT_PRIVATE_IP>/ovpn/packages/node-runtime-ubuntu2204-amd64.tar.gz -I
-
-curl --cacert "$HOME/dist/bootstrap-https/bootstrap-root-ca.pem" -u bootstrap:'<BOOTSTRAP_PASSWORD>' \
-  https://<BOOTSTRAP_ENDPOINT_PRIVATE_IP>/ovpn/issued/ovpn-node-ng-a-01.tar.gz -I
-
-curl --cacert "$HOME/dist/bootstrap-https/bootstrap-root-ca.pem" -u bootstrap:'<BOOTSTRAP_PASSWORD>' \
-  https://<BOOTSTRAP_ENDPOINT_PRIVATE_IP>/ovpn/issued/ovpn-gw-pri-01.tar.gz -I
-```
-
-권장 규칙:
-
-- node: `/srv/bootstrap/ovpn/issued/<NODE_ID>.tar.gz`
-- gateway: `/srv/bootstrap/ovpn/issued/<GATEWAY_ID>.tar.gz`
-- runtime package: `/srv/bootstrap/ovpn/packages/node-runtime-ubuntu2204-amd64.tar.gz`
-- `umask 077` 상태에서는 일반 `cp`로 올리면 `0600 root:root`가 돼 nginx가 `403 Forbidden`을 낼 수 있다. 따라서 bootstrap 저장소 업로드는 문서처럼 `install -o www-data -g www-data -m 0644 ...`로 수행한다.
-- bundle 내부 파일명은 항상 `client.crt`, `client.key`를 사용한다
-  - `<NODE_ID>` 또는 `<GATEWAY_ID>`는 tar.gz 객체명 식별용이다
-  - 실제 인증서 식별값은 bundle 내부 `bundle-info.txt`의 `CN`과 CA 인덱스로 추적한다
-- 폐기된 bundle은 `revoked/`로 이동
-
-`5.11`까지 수행한 상태를 빠르게 확인하려면, repo의 아래 스크립트를 `CA / Bootstrap Server`로 복사해 실행한다.
-
-- `scripts/check-bootstrap-stage.sh`
-
-예시:
-
-```bash
-chmod +x ./check-bootstrap-stage.sh
-./check-bootstrap-stage.sh \
-  --bootstrap-ip <BOOTSTRAP_ENDPOINT_PRIVATE_IP> \
-  --bootstrap-password '<BOOTSTRAP_PASSWORD>'
-```
-
 다음 단계 선택:
 
-- `주 방안(각 worker node에 OpenVPN client)`을 진행할 것이면 `6장 -> 7장`으로 간다.
-- `추가 방안 1(VPN Gateway VM)`을 진행할 것이면 `6장 -> 8장`으로 간다.
-- `추가 방안 2(sidecar)`를 진행할 때만 `5.12`를 수행한다.
-
-### 5.12 sidecar용 Secret 생성 예시
-
-Pod별 즉시 발급보다 `workload 단위 cert`가 더 현실적이다.
-
-예시:
-
-```bash
-bash ~/easy-rsa/scripts/issue-client-bundle.sh ovpn-pod-ns1-app1-01 pod
-
-kubectl -n app-ns create secret generic ovpn-client-bundle-app1 \
-  --from-file=ca.crt="$HOME/dist/pods/ovpn-pod-ns1-app1-01/ca.crt" \
-  --from-file=client.crt="$HOME/dist/pods/ovpn-pod-ns1-app1-01/client.crt" \
-  --from-file=client.key="$HOME/dist/pods/ovpn-pod-ns1-app1-01/client.key" \
-  --from-file=tls-crypt.key="$HOME/dist/pods/ovpn-pod-ns1-app1-01/tls-crypt.key"
-```
-
-### 5.13 자동 발급형 Issuer API 별도 문서
-
-`Issuer API`는 현재 PoC 목표인 `정적 bundle 기반 bootstrap + 실제 OpenVPN 연결 검증`이 끝난 뒤 진행한다.
-
-상세 가이드는 별도 문서로 분리했다.
-
-- [openvpn-issuer-api-guide.md](C:/Users/user/Desktop/신기호/업무용/30.PoC/openvpn/pri-worker-test/openvpn-issuer-api-guide.md)
-
-현재 단계의 판단:
-
-- worker node / gateway VM / sidecar의 기본 연결 검증 전에는 `Issuer API`가 필수가 아니다.
-- `autoscale 대응`, `자동 발급`, `자동 회전`까지 검증하고 싶을 때만 별도 문서를 따라 진행한다.
+- `주 방안(각 worker node에 OpenVPN client)`을 진행할 것이면 `6장 -> 6.8 -> 7장`으로 간다.
+- `추가 방안 1(VPN Gateway VM)`을 운영형 자동 발급까지 같이 볼 것이면 `6장 -> 6.8 -> 8장`으로 간다.
+- `추가 방안 2(sidecar)`를 운영형 자동 발급까지 같이 볼 것이면 `6장 -> 6.8 -> 9장`으로 간다. Secret fallback 예시는 `9.4`에서 본다.
 
 ## 6. 공통 OpenVPN 서버 구축
 
@@ -782,7 +681,7 @@ sudo install -d -m 0755 /var/log/openvpn
   - `cloud-init`, `user script`, 운영 자동화 문서에는 `apt-get`이 더 적합하다
 - 기본 이미지에 `iptables` 명령이 이미 있어도 `iptables-persistent`는 규칙 영속화 때문에 따로 필요할 수 있다.
 - 이미 `nftables`, `iptables-restore`, `cloud-init`, 구성관리 도구로 규칙 영속화를 처리한다면 `iptables-persistent`는 생략 가능하다.
-- OpenVPN 서버 설정을 더 자세히 보려면 [openvpn-server-build-guide.md](C:\Users\user\Desktop\신기호\업무용\30.PoC\openvpn\pri-worker-test\openvpn-server-build-guide.md)를 참고한다.
+- OpenVPN 서버 설정을 더 자세히 보려면 [03-openvpn-server-build-guide.md](C:\Users\user\Desktop\신기호\업무용\30.PoC\openvpn\pri-worker-test\03-openvpn-server-build-guide.md)를 참고한다.
 
 번들 준비와 반입:
 
@@ -877,7 +776,7 @@ verb 3
 - 여기서는 `redirect-gateway`를 서버에서 일괄 push하지 않는다.
 - 클라이언트 종류별로 필요한 route가 달라서 `client config`에서 제어하는 편이 안전하다.
 - `crl.pem`은 권한 강등 이후에도 읽을 수 있게 `0644`로 두는 편이 일반적이다.
-- 더 자세한 directive별 설명과 의도적으로 넣지 않은 값은 [openvpn-server-build-guide.md](C:\Users\user\Desktop\신기호\업무용\30.PoC\openvpn\pri-worker-test\openvpn-server-build-guide.md)를 기준으로 본다.
+- 더 자세한 directive별 설명과 의도적으로 넣지 않은 값은 [03-openvpn-server-build-guide.md](C:\Users\user\Desktop\신기호\업무용\30.PoC\openvpn\pri-worker-test\03-openvpn-server-build-guide.md)를 기준으로 본다.
 
 ### 6.4 서버 NAT
 
@@ -925,7 +824,8 @@ Pod
 - `HTTP 경로`와 `DNS 경로`는 다를 수 있다
 - node 또는 gateway에 OpenVPN이 붙어 있어도 `CoreDNS upstream`이 닫혀 있으면 `curl google.com`은 실패한다
 - 먼저 `이름 해석 성공`, 그다음 `egress IP 확인` 순서로 검증해야 한다
-- 현재 `NodeGroup-A / worker-egress` 기본 템플릿은 `split DNS`를 전제로 한다
+- 일반적으로는 `OpenVPN client`가 `tun0`를 기본 egress로 잡고, public name도 `tun0` 경유 resolver로 풀리면 `node`에서 `curl google.com`이 되는 것이 맞다
+- 다만 현재 `NodeGroup-A / worker-egress` 표준 구성은 `Private URI image pull`까지 같이 만족해야 하므로 `split DNS`를 추가한다
   - `eth0 -> Private DNS`: `openstacklocal`, `container.nhncloud.com`, `nhncloudservice.com`
   - `tun0 -> 외부 DNS`: 그 외 public name
 
@@ -945,18 +845,43 @@ public name
   -> public internet name resolution
 ```
 
-### 6.7.0 현재 가이드의 보장 범위
+### 6.7.0 NKS 환경에서 split DNS가 추가되는 이유
 
-지금 문서는 `VPN 연결 성공`과 `node egress 성공`까지는 직접 보장하도록 작성돼 있지만, `pod에서 curl google.com`까지를 한 번에 자동 보장하는 문서는 아니다.
+일반 원칙부터 보면, `worker`나 `gateway VM`에 `OpenVPN client`를 설치하고 기본 outbound를 `tun0`로 보내면 `node`에서 `curl google.com`은 되는 것이 맞다.
+
+즉 아래 조건만 맞으면 `split DNS` 자체는 필수는 아니다.
+
+- `tun0`가 기본 egress로 잡힌다
+- public name 조회가 `tun0` 경유 resolver로 성공한다
+- HTTP/HTTPS outbound가 VPN 뒤에서 정상 허용된다
+
+하지만 현재 `NKS Private Worker`의 `NodeGroup-A / worker-egress` 표준 구성은 여기서 한 단계 더 요구한다.
+
+- 같은 node가 `public internet egress`도 해야 한다
+- 동시에 `kubelet/containerd`가 `Private URI image pull`도 해야 한다
+- 따라서 `private registry / object storage / VPC internal name`은 `eth0`와 `Private DNS`로 남겨야 한다
+
+그래서 현재 표준 구성에서는 `split DNS`를 추가한다.
+
+- `eth0 -> Private DNS`
+  - `openstacklocal`
+  - `container.nhncloud.com`
+  - `nhncloudservice.com`
+- `tun0 -> 외부 DNS`
+  - 그 외 public name
 
 정리:
 
-- `worker-egress` user script + OpenVPN 서버 + node DNS uplink까지 맞으면 `node`에서 `curl -I https://www.google.com`은 재현 가능하다
-- 하지만 `pod`는 아래 조건이 하나 더 맞아야 한다
-  - test Pod 이미지가 `Private URI`로 정상 pull 된다
-  - test Pod가 의도한 node group에 스케줄된다
-  - `CoreDNS`가 외부 DNS를 실제로 풀 수 있다
-  - `NetworkPolicy`, `CNI`, `dnsPolicy`가 외부 조회를 막지 않는다
+- `node에 OpenVPN client를 설치하는 실행 방안` 전체가 `split DNS`를 반드시 요구하는 것은 아니다
+- `Private NKS + Private URI image pull + public internet egress`를 같은 node에서 같이 처리할 때 `split DNS`가 사실상 필요해진다
+- 현재 표준 경로는 이 전제를 반영해 `split DNS`를 기본값으로 둔다
+
+현재 실환경 검증 범위:
+
+- `NodeGroup-A / worker-egress / full-auto Issuer API / split DNS / Private URI image pull`
+- `node`에서 `curl -I https://www.google.com` 성공
+- `Private URI image pull` 성공 후 test Pod 생성 성공
+- `pod` 내부 `curl -I https://www.google.com` 성공
 
 즉, 현재 가이드의 운영형 해석은 아래 순서가 맞다.
 
@@ -966,18 +891,22 @@ public name
 4. `pod`에서 `nslookup google.com`
 5. 마지막으로 `pod`에서 `curl -I https://www.google.com`
 
-따라서 `node 성공 == pod 성공`으로 보면 안 된다. `pod`는 `CoreDNS`와 image pull 경로를 따로 확인해야 한다.
+따라서 현재 실환경에서는 `pod`까지 성공했더라도, 다른 환경에 그대로 옮길 때는 여전히 `CoreDNS`와 image pull 경로를 따로 확인해야 한다.
 
 기본 원칙:
 
 - `NKS`를 쓰는 동안에는 먼저 `CoreDNS`와 기본 `dnsPolicy: ClusterFirst`를 그대로 유지한다
 - 즉 `CoreDNS ConfigMap` 수정은 기본값이 아니라 `문제 확인 후 조정하는 단계`로 본다
 - DNS 문제를 OpenVPN 문제와 섞지 않기 위해, 먼저 `cluster DNS`, 그다음 `external DNS`, 마지막으로 `HTTP egress` 순서로 본다
+- `kubernetes.default.svc.cluster.local`, `<svc>.<ns>.svc.cluster.local` 같은 이름은 `CoreDNS`가 클러스터 내부에서 직접 처리한다
+- 따라서 현재 `split DNS`는 `cluster.local` 이름 자체를 바꾸는 것이 아니라, `CoreDNS upstream`과 node의 `private/public name resolution` 경로에 영향을 주는 것으로 이해하는 편이 맞다
+- `Ingress host`는 `CoreDNS`가 자동 생성하지 않으므로, `Private DNS` 또는 공인 DNS 레코드가 별도로 있어야 한다
 
 ### 6.7.1 DNS 관련 작업의 필수 / 필요 / 선택
 
 필수:
 
+- `cluster.local` 이름과 `external domain`을 분리해서 본다
 - `Pod -> CoreDNS -> upstream DNS` 현재 경로를 먼저 확인한다
 - `kubectl exec ... nslookup kubernetes.default.svc.cluster.local`로 cluster DNS가 정상인지 본다
 - `kubectl exec ... nslookup google.com`으로 외부 이름 해석이 되는지 본다
@@ -1003,13 +932,13 @@ public name
   - 필요: `iptables-persistent` 패키지 사용
   - 선택: `nftables`, `iptables-restore`, `cloud-init`, 구성관리 도구로 대체
 - `bootstrap endpoint`
-  - 필수: node/gateway가 bundle을 안전하게 받는 경로
+  - 필수: node/gateway가 공통 패키지와 bootstrap CA를 안전하게 받는 경로
   - 필요: 고정 bootstrap endpoint
-  - 선택: `Issuer API`로 실시간 발급까지 자동화
+  - 선택: `/ovpn/issued/` 같은 정적 bundle fallback 경로
 - `Issuer API`
-  - 필수: 아님
-  - 필요: autoscale 대응, node별 자동 발급, workload별 자동 발급이 목표일 때
-  - 선택: PoC에서 수동 발급 또는 사전 발급 bundle로 대체
+  - 필수: 현재 표준인 `NodeGroup-A / worker-egress user script / full-auto Issuer API`를 그대로 쓸 때
+  - 필요: gateway VM, sidecar도 같은 2단계 자동 발급 패턴으로 확장하고 싶을 때
+  - 선택: worker 표준을 쓰지 않고 PoC용 수동 발급 또는 정적 bundle fallback만 유지할 때
 - `Secure Key Manager`
   - 필수: 아님
   - 필요: sidecar Secret의 at-rest 보호를 강화하고 싶을 때
@@ -1112,6 +1041,35 @@ kubectl exec -it <pod> -- curl -I https://www.google.com
 - 필요하면 `CoreDNS` upstream을 `터널을 통해 도달 가능한 DNS` 또는 `Public VPC에서 허용된 DNS`로 조정한다
 - `kubernetes.default.svc.cluster.local`은 되는데 `google.com`만 안 되면 외부 DNS upstream 문제일 가능성이 높다
 - test pod에 `dnsPolicy: None`을 줬더니 성공하면, VPN보다 `Cluster DNS 경로`가 원인일 가능성이 높다
+- `service.cluster.local`은 되는데 `Ingress host`만 안 되면 `CoreDNS`보다 해당 host의 별도 DNS 레코드부터 본다
+
+### 6.8 자동 발급형 Issuer API 연결
+
+현재 운영형 기준의 `NodeGroup-A / worker-egress user script`는 `Issuer API` 자동 발급 기준으로 정리한다.
+
+공통 구축 순서는 아래처럼 읽는 편이 가장 자연스럽다.
+
+1. `5.1 ~ 5.8`로 `CA / Bootstrap Server`와 bootstrap endpoint를 준비한다.
+2. `6.1 ~ 6.7`로 `OpenVPN Server`를 먼저 준비하고 서버 자체가 정상인지 확인한다.
+3. [04-openvpn-issuer-api-guide.md](./04-openvpn-issuer-api-guide.md)를 따라 `Issuer API`를 구축한다.
+4. 다시 이 문서의 `7.5`로 돌아와 `NodeGroup-A / user script` 자동 발급을 검증한다.
+
+즉 `Issuer API`는 `worker 표준`보다 앞서 준비되는 공통 구성이다. 다만 실제 자동 발급을 처음 검증한 대상이 `worker user script`라서, 이 문서에서는 `7장`과 가장 강하게 연결해 설명한다.
+
+이 문서와 [04-openvpn-issuer-api-guide.md](./04-openvpn-issuer-api-guide.md)의 역할은 아래처럼 나눈다.
+
+- 이 문서:
+  - worker, gateway, sidecar가 어떤 발급 흐름과 어떤 템플릿을 쓰는지 설명
+  - `1차 launcher`, `2차 bootstrap script`, 직접 설치 절차 같은 소비자 측 로직 설명
+- [04-openvpn-issuer-api-guide.md](./04-openvpn-issuer-api-guide.md):
+  - `ta-sgh-ca`에서 `Issuer API`를 실제로 설치하고 서비스로 띄우는 절차
+  - `node-token`, `node-bundle`과 확장 endpoint의 구현 기준 설명
+
+현재 검증 상태:
+
+- `worker node`는 `private IP Issuer API + Basic Auth -> node-token -> node-bundle` 흐름이 실제로 검증 완료됐다.
+- `gateway VM / sidecar`도 같은 `token -> bundle` 2단계 패턴으로 구현할 수 있다.
+- 다만 현재 `ta-sgh-ca`의 실구현은 `worker node` endpoint까지이므로, `gateway/workload` endpoint는 동일 로직으로 확장 가능한 상태라고 이해하는 편이 맞다.
 
 ## 7. 주 방안 - 각 worker node에 OpenVPN client
 
@@ -1119,9 +1077,9 @@ kubectl exec -it <pod> -- curl -I https://www.google.com
 
 | 세부 방안 | 가능 여부 | 적합도 | 판단 |
 |---|---:|---:|---|
-| 사용자 스크립트 이용 Auto Scale 대응 | 가능 | 높음 | NKS 환경과 가장 잘 맞는다. 신규 node에도 자동 반영할 수 있다. |
-| 직접 설치 | 가능 | 중 | PoC, 장애 분석, 단기 검증에는 유용하다. 운영 표준으로 쓰기엔 반복 작업이 많다. |
-| DaemonSet 등 자동 설치 | 조건부 가능 | 낮음 | `hostNetwork`, `privileged`, `NET_ADMIN`, host route 수정이 필요해 운영성이 나쁘다. |
+| 사용자 스크립트 이용 Auto Scale 대응 | 가능 | 높음 | 현재 실환경에서 검증 완료된 표준 경로다. 신규 node scale-out 시에도 자동 반영할 수 있다. |
+| 직접 설치 | 가능 | 중 | `7.5`와 같은 자동 발급 로직을 수동으로 수행하는 방식이다. PoC, 장애 분석, 단기 검증에는 유용하다. |
+| DaemonSet 등 자동 설치 | 조건부 가능 | 낮음 | 이론상 가능하지만 `hostNetwork`, `privileged`, `NET_ADMIN`, host route 수정이 필요해 운영성이 나쁘다. 현재 표준 경로는 아니다. |
 
 ### 7.2 적용 대상
 
@@ -1143,13 +1101,13 @@ kubectl exec -it <pod> -- curl -I https://www.google.com
 
 ### 7.4 인증서 배포 방식
 
-운영 권장:
+현재 표준:
 
-- user script에서 `secure bootstrap endpoint`로 node별 bundle을 fetch
-- endpoint는 `고정 URL`로 운영하고, node마다 새로운 endpoint를 만들지 않는다
-- bundle 이름은 `hostname`보다 `nodegroup-role-random` 또는 `사전 할당된 node id`로 매핑하는 편이 낫다
-- worker node마다 `고유 cert/key`를 발급한다
-- `duplicate-cn`은 쓰지 않는다
+- worker node는 `bootstrap endpoint`에서 공통 패키지와 `worker-egress-bootstrap.sh`를 받는다.
+- 그 다음 `Issuer API`에 `node-token -> node-bundle` 순서로 요청해 node별 bundle을 동적으로 받는다.
+- endpoint는 `고정 URL`로 운영하고, node마다 새로운 endpoint를 만들지 않는다.
+- worker node마다 `고유 cert/key`를 발급한다.
+- `duplicate-cn`은 쓰지 않는다.
 
 권장하지 않음:
 
@@ -1158,13 +1116,9 @@ kubectl exec -it <pod> -- curl -I https://www.google.com
 
 실무 메모:
 
-- Auto Scale까지 고려하면 두 방식 중 하나를 택한다
-  1. `사전 발급 풀`
-     - nodegroup별로 미리 여러 개의 cert/bundle을 만들어 둔다
-     - 신규 node는 bootstrap endpoint에서 빈 bundle 하나를 할당받는다
-  2. `발급 자동화 API`
-     - 승인된 bootstrap client만 CSR 제출 또는 bundle 요청 가능
-     - CA 또는 중간 발급 서비스가 즉시 발급 후 반환한다
+- 이 문서의 `주 방안`은 `발급 자동화 API` 기준으로 설명한다.
+- `사전 발급 풀` 또는 정적 bundle download는 PoC fallback, 수동 분석, 비상 복구용으로만 남겨두는 편이 맞다.
+- `gateway VM`, `sidecar`도 운영형으로 가려면 결국 같은 2단계 자동 발급 패턴으로 맞추는 편이 정합성이 높다.
 
 공공기관/보안 민감 고객 기준 권장:
 
@@ -1186,6 +1140,8 @@ kubectl exec -it <pod> -- curl -I https://www.google.com
 
 `CA / Bootstrap Server`에서 기존 파일을 교체한다. `tee >`가 기존 파일을 덮어쓰므로 `rm`은 선택이지만, 재배포를 분명히 하려면 아래처럼 한 번 지우고 다시 배치한다.
 
+템플릿:
+
 ```bash
 sudo rm -f /srv/bootstrap/ovpn/packages/worker-egress-bootstrap.sh
 
@@ -1199,8 +1155,17 @@ BOOTSTRAP_USER="${BOOTSTRAP_USER:?}"
 BOOTSTRAP_PASSWORD="${BOOTSTRAP_PASSWORD:?}"
 BOOTSTRAP_BASE_URL="https://${BOOTSTRAP_IP}/ovpn"
 BOOTSTRAP_CA="${BOOTSTRAP_CA:-/etc/ssl/certs/bootstrap-root-ca.pem}"
+ISSUER_TOKEN_URL="${ISSUER_TOKEN_URL:-https://${BOOTSTRAP_IP}:8443/v1/bootstrap/node-token}"
+ISSUER_BUNDLE_URL="${ISSUER_BUNDLE_URL:-https://${BOOTSTRAP_IP}:8443/v1/bootstrap/node-bundle}"
+ISSUER_CACERT="${ISSUER_CACERT:-${BOOTSTRAP_CA}}"
 
 NODE_ID="${NODE_ID:?}"
+NODE_GROUP="${NODE_GROUP:?}"
+CLUSTER_NAME="${CLUSTER_NAME:?}"
+NODE_ROLE="${NODE_ROLE:-worker}"
+METADATA_INSTANCE_ID="${METADATA_INSTANCE_ID:?}"
+METADATA_LOCAL_HOSTNAME="${METADATA_LOCAL_HOSTNAME:?}"
+METADATA_PRIVATE_IP="${METADATA_PRIVATE_IP:?}"
 OPENVPN_SERVER_IP="${OPENVPN_SERVER_IP:?}"
 OPENVPN_SERVER_PORT="${OPENVPN_SERVER_PORT:-1194}"
 OPENVPN_PROTO="${OPENVPN_PROTO:-udp}"
@@ -1221,7 +1186,6 @@ SERVICE_GATEWAY_NEXT_HOP="${SERVICE_GATEWAY_NEXT_HOP:-}"
 SERVICE_GATEWAY_BYPASS_IPS="${SERVICE_GATEWAY_BYPASS_IPS:-}"
 
 RUNTIME_BUNDLE="${RUNTIME_BUNDLE:-node-runtime-ubuntu2204-amd64.tar.gz}"
-CLIENT_BUNDLE="${NODE_ID}.tar.gz"
 
 WORK_DIR="/opt/ovpn-bootstrap"
 PKG_DIR="/root/pkg/node-runtime"
@@ -1261,12 +1225,40 @@ if ! have_runtime_pkgs; then
   }
 fi
 
-curl -fsSL --retry 5 --retry-delay 3 --cacert "${BOOTSTRAP_CA}" \
-  -u "${BOOTSTRAP_USER}:${BOOTSTRAP_PASSWORD}" \
-  -o "${WORK_DIR}/${CLIENT_BUNDLE}" \
-  "${BOOTSTRAP_BASE_URL}/issued/${CLIENT_BUNDLE}"
+cat > "${WORK_DIR}/node-bundle-request.json" <<EOF_JSON
+{
+  "node_id": "${NODE_ID}",
+  "node_group": "${NODE_GROUP}",
+  "role": "${NODE_ROLE}",
+  "cluster": "${CLUSTER_NAME}",
+  "metadata": {
+    "instance_id": "${METADATA_INSTANCE_ID}",
+    "local_hostname": "${METADATA_LOCAL_HOSTNAME}",
+    "private_ip": "${METADATA_PRIVATE_IP}"
+  }
+}
+EOF_JSON
 
-tar xzf "${WORK_DIR}/${CLIENT_BUNDLE}" -C "${OVPN_PKI_DIR}"
+curl -fsS --retry 5 --retry-delay 3 --cacert "${ISSUER_CACERT}" -X POST "${ISSUER_TOKEN_URL}" \
+  -u "${BOOTSTRAP_USER}:${BOOTSTRAP_PASSWORD}" \
+  -H "Content-Type: application/json" \
+  --data @"${WORK_DIR}/node-bundle-request.json" \
+  -o "${WORK_DIR}/node-token-response.json"
+
+NODE_TOKEN="$(
+  python3 - <<'PY' "${WORK_DIR}/node-token-response.json"
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["token"])
+PY
+)"
+
+curl -fsS --retry 5 --retry-delay 3 --cacert "${ISSUER_CACERT}" -X POST "${ISSUER_BUNDLE_URL}" \
+  -H "Authorization: Bearer ${NODE_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data @"${WORK_DIR}/node-bundle-request.json" \
+  -o "${WORK_DIR}/${NODE_ID}.tar.gz"
+
+tar xzf "${WORK_DIR}/${NODE_ID}.tar.gz" -C "${OVPN_PKI_DIR}"
 
 chmod 0644 "${OVPN_PKI_DIR}/ca.crt"
 chmod 0644 "${OVPN_PKI_DIR}/client.crt"
@@ -1349,15 +1341,21 @@ sudo chmod 0644 /srv/bootstrap/ovpn/packages/worker-egress-bootstrap.sh
 
 NKS 노드그룹에는 아래처럼 짧은 launcher만 넣는다.
 
+템플릿:
+
 ```bash
 #!/bin/bash
 set -euxo pipefail
 exec > >(tee -a /var/log/ovpn-user-script.log) 2>&1
 
-BOOTSTRAP_IP="172.16.200.44"
-BOOTSTRAP_USER="bootstrap"
+BOOTSTRAP_IP="<BOOTSTRAP_IP>"
+BOOTSTRAP_USER="<BOOTSTRAP_USER>"
 BOOTSTRAP_PASSWORD="<BOOTSTRAP_PASSWORD>"
 BOOTSTRAP_BASE_URL="https://${BOOTSTRAP_IP}/ovpn"
+NODE_ID="$(hostname -s)"
+METADATA_INSTANCE_ID="$(cat /var/lib/cloud/data/instance-id 2>/dev/null || hostname -s)"
+METADATA_LOCAL_HOSTNAME="$(hostname -s)"
+METADATA_PRIVATE_IP="$(hostname -I | awk '{print $1}')"
 
 curl -k -fsSL -u "${BOOTSTRAP_USER}:${BOOTSTRAP_PASSWORD}" \
   -o /var/tmp/worker-egress-bootstrap.sh \
@@ -1368,10 +1366,16 @@ chmod 0700 /var/tmp/worker-egress-bootstrap.sh
 BOOTSTRAP_IP="${BOOTSTRAP_IP}" \
 BOOTSTRAP_USER="${BOOTSTRAP_USER}" \
 BOOTSTRAP_PASSWORD="${BOOTSTRAP_PASSWORD}" \
-NODE_ID="ovpn-node-ng-a-01" \
+NODE_ID="${NODE_ID}" \
+NODE_GROUP="<NODE_GROUP>" \
+CLUSTER_NAME="<CLUSTER_NAME>" \
+NODE_ROLE="worker" \
+METADATA_INSTANCE_ID="${METADATA_INSTANCE_ID}" \
+METADATA_LOCAL_HOSTNAME="${METADATA_LOCAL_HOSTNAME}" \
+METADATA_PRIVATE_IP="${METADATA_PRIVATE_IP}" \
 OPENVPN_SERVER_IP="<OPENVPN_SERVER_PRIVATE_IP>" \
-OPENVPN_SERVER_PORT="1194" \
-OPENVPN_PROTO="udp" \
+OPENVPN_SERVER_PORT="<OPENVPN_SERVER_PORT>" \
+OPENVPN_PROTO="<OPENVPN_PROTO>" \
 PRIVATE_VPC_NETWORK="<PRIVATE_VPC_NETWORK>" \
 PRIVATE_VPC_NETMASK="<PRIVATE_VPC_NETMASK>" \
 PUBLIC_VPC_NETWORK="<PUBLIC_VPC_NETWORK>" \
@@ -1390,17 +1394,74 @@ RUNTIME_BUNDLE="node-runtime-ubuntu2204-amd64.tar.gz" \
 /var/tmp/worker-egress-bootstrap.sh
 ```
 
+실환경 예시:
+
+```bash
+#!/bin/bash
+set -euxo pipefail
+exec > >(tee -a /var/log/ovpn-user-script.log) 2>&1
+
+BOOTSTRAP_IP="172.16.200.44"
+BOOTSTRAP_USER="bootstrap"
+BOOTSTRAP_PASSWORD="tlsrlgh07"
+BOOTSTRAP_BASE_URL="https://${BOOTSTRAP_IP}/ovpn"
+NODE_ID="$(hostname -s)"
+METADATA_INSTANCE_ID="$(cat /var/lib/cloud/data/instance-id 2>/dev/null || hostname -s)"
+METADATA_LOCAL_HOSTNAME="$(hostname -s)"
+METADATA_PRIVATE_IP="$(hostname -I | awk '{print $1}')"
+
+curl -k -fsSL -u "${BOOTSTRAP_USER}:${BOOTSTRAP_PASSWORD}" \
+  -o /var/tmp/worker-egress-bootstrap.sh \
+  "${BOOTSTRAP_BASE_URL}/packages/worker-egress-bootstrap.sh"
+
+chmod 0700 /var/tmp/worker-egress-bootstrap.sh
+
+BOOTSTRAP_IP="${BOOTSTRAP_IP}" \
+BOOTSTRAP_USER="${BOOTSTRAP_USER}" \
+BOOTSTRAP_PASSWORD="${BOOTSTRAP_PASSWORD}" \
+NODE_ID="${NODE_ID}" \
+NODE_GROUP="default-worker" \
+CLUSTER_NAME="ta-sgh-pri-cls" \
+NODE_ROLE="worker" \
+METADATA_INSTANCE_ID="${METADATA_INSTANCE_ID}" \
+METADATA_LOCAL_HOSTNAME="${METADATA_LOCAL_HOSTNAME}" \
+METADATA_PRIVATE_IP="${METADATA_PRIVATE_IP}" \
+OPENVPN_SERVER_IP="192.168.200.25" \
+OPENVPN_SERVER_PORT="1194" \
+OPENVPN_PROTO="udp" \
+PRIVATE_VPC_NETWORK="172.16.0.0" \
+PRIVATE_VPC_NETMASK="255.255.0.0" \
+PUBLIC_VPC_NETWORK="192.168.200.0" \
+PUBLIC_VPC_NETMASK="255.255.255.0" \
+NKS_POD_NETWORK="10.100.0.0" \
+NKS_POD_NETMASK="255.255.0.0" \
+NKS_SERVICE_NETWORK="10.254.0.0" \
+NKS_SERVICE_NETMASK="255.255.0.0" \
+EGRESS_DNS_1="1.1.1.1" \
+EGRESS_DNS_2="8.8.8.8" \
+PRIVATE_DNS_SERVER="172.16.0.105" \
+PRIVATE_DNS_ROUTE_DOMAINS="openstacklocal container.nhncloud.com nhncloudservice.com" \
+SERVICE_GATEWAY_NEXT_HOP="" \
+SERVICE_GATEWAY_BYPASS_IPS="" \
+RUNTIME_BUNDLE="node-runtime-ubuntu2204-amd64.tar.gz" \
+/var/tmp/worker-egress-bootstrap.sh
+```
+
 실무 메모:
 
 - 긴 inline user script는 실제 환경에서 `userscript.sh=1 byte`처럼 비정상 전달될 수 있으므로 권장하지 않는다.
+- `7.5.1`의 2차 스크립트는 공용 템플릿이고, 실제 환경값과 node별 metadata는 `7.5.2` launcher가 넘겨준다.
+- 현재 운영형 자동 발급은 `Basic Auth -> /v1/bootstrap/node-token -> 1회성 token -> /v1/bootstrap/node-bundle` 2단계다.
+- 따라서 node별 `BOOTSTRAP_TOKEN`을 launcher에 미리 넣지 않는다. 긴 수명의 bootstrap credential은 `BOOTSTRAP_USER`, `BOOTSTRAP_PASSWORD`다.
+- 위 예시는 `NODE_ID=hostname -s`, `METADATA_INSTANCE_ID=/var/lib/cloud/data/instance-id`, `METADATA_PRIVATE_IP=hostname -I 첫 번째 값`이라는 단순 가정을 쓴다.
 - 위 예시의 `bootstrap endpoint`는 `고정 URL`이며, 신규 node가 늘어날 때마다 endpoint를 새로 만드는 구조가 아니다.
-- `NODE_ID`는 `bundle tar.gz 객체명`을 찾기 위한 값이다. PoC 1차 검증은 고정값으로 두고, 운영에서는 `사전 할당된 node id`나 metadata 기반 매핑으로 바꾼다.
+- `NODE_ID`는 현재 `hostname -s`를 그대로 쓰고, Issuer API는 `metadata.local_hostname == node_id`, `metadata.private_ip == client_ip`, `instance_id 존재`를 먼저 검증한다.
 - 위 예시는 `정적 bootstrap repo + Basic Auth` 기준이다. 운영에서는 `mTLS`, `signed URL`, workload identity 기반 검증으로 바꾸는 편이 맞다.
 - 1차는 `curl -k`로 2차와 `bootstrap-root-ca.pem`만 가져오고, 실제 bundle/runtime 다운로드부터 `--cacert`를 쓰는 구조다.
 - `RUNTIME_BUNDLE` 이름은 node OS에 맞게 맞춰야 한다. 예: `Ubuntu 22.04 -> node-runtime-ubuntu2204-amd64.tar.gz`
 - runtime bundle 설치 후 `openvpn`, `curl`, `ca-certificates`가 이미 들어왔으면 `apt-get -f install`을 더 진행하지 않는다. 일부 이미지에서 불필요한 의존성 복구가 다른 패키지까지 건드리며 실패하는 경우가 있었기 때문이다.
-- 운영 기준 DNS는 `split DNS`를 권장한다. `eth0`에는 `Private DNS`를 두고 `container.nhncloud.com`, `nhncloudservice.com`, `openstacklocal`을 보내고, `tun0`에는 외부 resolver를 두고 나머지 질의를 보낸다.
-- `curl google.com`까지 보려면 `HTTP route`만이 아니라 `DNS uplink`도 같이 잡아야 한다. 현재 `Ubuntu systemd-resolved` 기준 운영형 기본값은 `eth0`에 `Private DNS routed domains`, `tun0`에 외부 DNS와 `~.` domain을 두는 `split DNS`다.
+- 모든 `node 설치형 OpenVPN client` 방식이 `split DNS`를 요구하는 것은 아니다. 다만 현재 `NodeGroup-A` 운영형은 `Private URI image pull`까지 같이 만족해야 하므로 `split DNS`를 기본값으로 둔다.
+- `curl google.com`까지 보려면 `HTTP route`만이 아니라 `DNS uplink`도 같이 잡아야 한다. 현재 `Ubuntu systemd-resolved` 기준 `NodeGroup-A` 운영형 기본값은 `eth0`에 `Private DNS routed domains`, `tun0`에 외부 DNS와 `~.` domain을 두는 `split DNS`다.
 - PoC에서는 `1.1.1.1`, `8.8.8.8`로 검증할 수 있지만, 운영에서는 조직 승인 resolver 또는 VPN 뒤에서 도달 가능한 resolver를 넣는 편이 맞다.
 - `NCR`, `OBS`, 내부 artifact registry pull은 `Pod`가 아니라 `node의 kubelet/containerd`가 수행한다.
 - 운영형 기본값은 `Private DNS`로 `NCR Private Endpoint -> NCR SGW IP`, `Object Storage 도메인 -> OBS SGW IP`를 먼저 보장하는 것이다.
@@ -1411,7 +1472,7 @@ RUNTIME_BUNDLE="node-runtime-ubuntu2204-amd64.tar.gz" \
 
 `NodeGroup-A`의 `worker-egress` 검증 중 `NCR` 또는 `OBS` 이미지 pull이 필요하면, 먼저 `Private URI`가 `SGW IP`로 정상 해석되는지부터 본다.
 
-예시:
+실환경 예시:
 
 ```bash
 getent hosts private-c0978417-kr1-registry.container.nhncloud.com
@@ -1429,7 +1490,8 @@ getent hosts kr1-api-object-storage.nhncloudservice.com
 메모:
 
 - `Private URI`가 `SGW IP`로 풀리지 않는다면 route보다 name resolution을 먼저 고쳐야 한다.
-- timeout, `link: tun0`, 임시 route 예외 같은 장애 처리 흐름은 [openvpn-nks-troubleshooting-guide.md](./openvpn-nks-troubleshooting-guide.md)에서 본다.
+- timeout, `link: tun0`, 임시 route 예외 같은 장애 처리 흐름은 [06-openvpn-nks-troubleshooting-guide.md](./06-openvpn-nks-troubleshooting-guide.md)에서 본다.
+- 현재 실환경에서는 `split DNS` 적용 후 `private-<REGISTRY_ID>...`가 `link: eth0`로 풀렸고, 그 상태에서 image pull이 성공해 test Pod 생성까지 확인했다.
 
 검증:
 
@@ -1455,18 +1517,25 @@ curl --max-time 10 https://ifconfig.me
 
 자동 발급 Issuer API를 직접 호출하는 예시:
 
+템플릿:
+
 ```bash
 #!/bin/bash
 set -euxo pipefail
 
-ISSUER_URL="https://issuer.internal:8443/v1/bootstrap/node-bundle"
-ISSUER_CACERT="/etc/ssl/certs/issuer-root-ca.pem"
-NODE_ID="${NODE_ID_OVERRIDE:-$(hostname)}"
-BOOTSTRAP_TOKEN="<NODE_BOOTSTRAP_TOKEN>"
+ISSUER_TOKEN_URL="https://<ISSUER_API_PRIVATE_IP>:8443/v1/bootstrap/node-token"
+ISSUER_BUNDLE_URL="https://<ISSUER_API_PRIVATE_IP>:8443/v1/bootstrap/node-bundle"
+ISSUER_CACERT="/etc/ssl/certs/bootstrap-root-ca.pem"
+NODE_ID="${NODE_ID_OVERRIDE:-$(hostname -s)}"
 RUNTIME_BUNDLE_URL="https://<BOOTSTRAP_ENDPOINT_PRIVATE_IP>/ovpn/packages/node-runtime-ubuntu2204-amd64.tar.gz"
-BOOTSTRAP_USER="bootstrap"
+BOOTSTRAP_USER="<BOOTSTRAP_USER>"
 BOOTSTRAP_PASSWORD="<BOOTSTRAP_PASSWORD>"
 BOOTSTRAP_CACERT="/etc/ssl/certs/bootstrap-root-ca.pem"
+NODE_GROUP="<NODE_GROUP>"
+CLUSTER_NAME="<CLUSTER_NAME>"
+INSTANCE_ID="<INSTANCE_ID_FROM_METADATA>"
+LOCAL_HOSTNAME="<LOCAL_HOSTNAME_FROM_METADATA>"
+PRIVATE_IP="<PRIVATE_IP_FROM_METADATA>"
 
 install -d -m 0750 /root/pkg/node-runtime
 curl -fsSL --cacert "${BOOTSTRAP_CACERT}" -u "${BOOTSTRAP_USER}:${BOOTSTRAP_PASSWORD}" \
@@ -1480,14 +1549,97 @@ install -d -m 0750 /etc/openvpn/client/pki
 cat >/root/node-bundle-request.json <<EOF
 {
   "node_id": "${NODE_ID}",
-  "node_group": "nodegroup-a",
+  "node_group": "${NODE_GROUP}",
   "role": "worker",
-  "cluster": "nks-pri-test"
+  "cluster": "${CLUSTER_NAME}",
+  "metadata": {
+    "instance_id": "${INSTANCE_ID}",
+    "local_hostname": "${LOCAL_HOSTNAME}",
+    "private_ip": "${PRIVATE_IP}"
+  }
 }
 EOF
 
-curl -fsS --cacert "${ISSUER_CACERT}" -X POST "${ISSUER_URL}" \
-  -H "Authorization: Bearer ${BOOTSTRAP_TOKEN}" \
+curl -fsS --cacert "${ISSUER_CACERT}" -X POST "${ISSUER_TOKEN_URL}" \
+  -u "${BOOTSTRAP_USER}:${BOOTSTRAP_PASSWORD}" \
+  -H "Content-Type: application/json" \
+  --data @/root/node-bundle-request.json \
+  -o /root/node-token-response.json
+
+NODE_TOKEN="$(
+  python3 - <<'PY' /root/node-token-response.json
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["token"])
+PY
+)"
+
+curl -fsS --cacert "${ISSUER_CACERT}" -X POST "${ISSUER_BUNDLE_URL}" \
+  -H "Authorization: Bearer ${NODE_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data @/root/node-bundle-request.json \
+  -o /root/ovpn-node.tgz
+
+tar -xzf /root/ovpn-node.tgz -C /etc/openvpn/client/pki
+```
+
+실환경 예시:
+
+```bash
+#!/bin/bash
+set -euxo pipefail
+
+ISSUER_TOKEN_URL="https://172.16.200.44:8443/v1/bootstrap/node-token"
+ISSUER_BUNDLE_URL="https://172.16.200.44:8443/v1/bootstrap/node-bundle"
+ISSUER_CACERT="/etc/ssl/certs/bootstrap-root-ca.pem"
+NODE_ID="${NODE_ID_OVERRIDE:-$(hostname -s)}"
+RUNTIME_BUNDLE_URL="https://172.16.200.44/ovpn/packages/node-runtime-ubuntu2204-amd64.tar.gz"
+BOOTSTRAP_USER="bootstrap"
+BOOTSTRAP_PASSWORD="tlsrlgh07"
+BOOTSTRAP_CACERT="/etc/ssl/certs/bootstrap-root-ca.pem"
+NODE_GROUP="default-worker"
+CLUSTER_NAME="ta-sgh-pri-cls"
+INSTANCE_ID="<INSTANCE_ID_FROM_METADATA>"
+LOCAL_HOSTNAME="<LOCAL_HOSTNAME_FROM_METADATA>"
+PRIVATE_IP="<PRIVATE_IP_FROM_METADATA>"
+
+install -d -m 0750 /root/pkg/node-runtime
+curl -fsSL --cacert "${BOOTSTRAP_CACERT}" -u "${BOOTSTRAP_USER}:${BOOTSTRAP_PASSWORD}" \
+  "${RUNTIME_BUNDLE_URL}" -o /root/node-runtime.tgz
+tar -xzf /root/node-runtime.tgz -C /root/pkg/node-runtime
+dpkg -i /root/pkg/node-runtime/*.deb || true
+DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::archives=/root/pkg/node-runtime --no-download -f install -y
+
+install -d -m 0750 /etc/openvpn/client/pki
+
+cat >/root/node-bundle-request.json <<EOF
+{
+  "node_id": "${NODE_ID}",
+  "node_group": "${NODE_GROUP}",
+  "role": "worker",
+  "cluster": "${CLUSTER_NAME}",
+  "metadata": {
+    "instance_id": "${INSTANCE_ID}",
+    "local_hostname": "${LOCAL_HOSTNAME}",
+    "private_ip": "${PRIVATE_IP}"
+  }
+}
+EOF
+
+curl -fsS --cacert "${ISSUER_CACERT}" -X POST "${ISSUER_TOKEN_URL}" \
+  -u "${BOOTSTRAP_USER}:${BOOTSTRAP_PASSWORD}" \
+  -H "Content-Type: application/json" \
+  --data @/root/node-bundle-request.json \
+  -o /root/node-token-response.json
+
+NODE_TOKEN="$(
+  python3 - <<'PY' /root/node-token-response.json
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["token"])
+PY
+)"
+
+curl -fsS --cacert "${ISSUER_CACERT}" -X POST "${ISSUER_BUNDLE_URL}" \
+  -H "Authorization: Bearer ${NODE_TOKEN}" \
   -H "Content-Type: application/json" \
   --data @/root/node-bundle-request.json \
   -o /root/ovpn-node.tgz
@@ -1496,6 +1648,33 @@ tar -xzf /root/ovpn-node.tgz -C /etc/openvpn/client/pki
 ```
 
 이 방식은 기존 `정적 download endpoint` 대신 `Issuer API`가 발급과 응답을 직접 수행한다.
+
+실환경 메모:
+
+- 아래 내용은 현재 `ta-sgh-ca`에 실제 반영된 worker 자동발급 기준이다.
+- `gateway VM`, `sidecar workload`는 같은 패턴으로 확장할 수 있지만, 현재 CA 서버에는 아직 worker endpoint만 실제 구현돼 있다.
+
+현재 `ta-sgh-ca`에 반영한 `Issuer API`는 아래를 전제로 한다.
+
+- endpoint: `https://172.16.200.44:8443`
+- 서버 TLS: `/etc/nginx/tls/bootstrap.crt`, `/etc/nginx/tls/bootstrap.key`
+- runtime 1회성 token 저장소: `/opt/ovpn-issuer/tokens.json`
+- `node-token`은 `Basic Auth + metadata`를 검증하고 짧은 만료의 1회성 token을 발급한다.
+- `node-bundle`은 그 1회성 token을 소모하면서 cert/bundle을 발급한다.
+
+현재까지 실제 검증된 범위:
+
+- `GET /healthz`
+- `Basic Auth -> node-token -> node-bundle` 2단계 self-test 성공
+- `EASYRSA_PASSIN` 설정 후 신규 cert 서명과 bundle 응답
+- `NodeGroup-A` 새 worker scale-out 시 `node-token -> node-bundle -> OpenVPN 연결 -> split DNS` end-to-end 성공
+- 같은 검증 흐름에서 `Private URI image pull -> test Pod 생성 -> pod curl https://www.google.com`까지 성공
+- 발급된 1회성 token은 성공 후 `used=true`로 소모
+
+아직 확장 전인 것:
+
+- `/v1/bootstrap/gateway-token`, `/v1/bootstrap/gateway-bundle`의 실제 서버 구현
+- `/v1/bootstrap/workload-token`, `/v1/bootstrap/workload-bundle`의 실제 서버 구현
 
 실무에서는 아래처럼 명시값을 넣는 편이 안전하다.
 
@@ -1511,48 +1690,111 @@ route 128.0.0.0 128.0.0.0 vpn_gateway
 
 ### 7.6 직접 설치 예시
 
-PoC나 장애 분석용으로 특정 worker node 한 대에 수동 설치할 때는 아래 절차를 쓴다.
+직접 설치는 별도 아키텍처가 아니다. 현재 표준인 `7.5.1` 2차 스크립트가 하는 일을 특정 worker node에서 사람이 순서대로 수동 실행하는 방식으로 이해하면 된다.
+
+즉 아래 절차는 다음 상황에서 쓴다.
+
+- `NodeGroup-A` launcher 없이 특정 node 한 대만 수동 검증하고 싶을 때
+- 장애 분석 중 `Issuer API`, `OpenVPN client`, `split DNS` 단계를 분리해서 보고 싶을 때
+- 새 템플릿을 적용하기 전에 수동으로 먼저 끝까지 재현하고 싶을 때
+
+템플릿:
 
 ```bash
-## 외부 다운로드 호스트
-sudo apt-get update
-sudo apt-get install -y apt-rdepends
+BOOTSTRAP_IP="<BOOTSTRAP_IP>"
+BOOTSTRAP_USER="<BOOTSTRAP_USER>"
+BOOTSTRAP_PASSWORD="<BOOTSTRAP_PASSWORD>"
+BOOTSTRAP_BASE_URL="https://${BOOTSTRAP_IP}/ovpn"
+BOOTSTRAP_CA="/etc/ssl/certs/bootstrap-root-ca.pem"
+ISSUER_TOKEN_URL="https://${BOOTSTRAP_IP}:8443/v1/bootstrap/node-token"
+ISSUER_BUNDLE_URL="https://${BOOTSTRAP_IP}:8443/v1/bootstrap/node-bundle"
 
-mkdir -p pkg/node-runtime
-cd pkg/node-runtime
+NODE_ID="$(hostname -s)"
+NODE_GROUP="<NODE_GROUP>"
+CLUSTER_NAME="<CLUSTER_NAME>"
+NODE_ROLE="worker"
+METADATA_INSTANCE_ID="$(cat /var/lib/cloud/data/instance-id 2>/dev/null || hostname -s)"
+METADATA_LOCAL_HOSTNAME="$(hostname -s)"
+METADATA_PRIVATE_IP="$(hostname -I | awk '{print $1}')"
 
-apt-rdepends openvpn ca-certificates curl 2>/dev/null \
-  | grep -E '^[a-z0-9][a-z0-9.+-]*(:[a-z0-9]+)?$' \
-  | sort -u > pkglist.raw
+PRIVATE_VPC_NETWORK="<PRIVATE_VPC_NETWORK>"
+PRIVATE_VPC_NETMASK="<PRIVATE_VPC_NETMASK>"
+PUBLIC_VPC_NETWORK="<PUBLIC_VPC_NETWORK>"
+PUBLIC_VPC_NETMASK="<PUBLIC_VPC_NETMASK>"
+NKS_POD_NETWORK="<NKS_POD_NETWORK>"
+NKS_POD_NETMASK="<NKS_POD_NETMASK>"
+NKS_SERVICE_NETWORK="<NKS_SERVICE_NETWORK>"
+NKS_SERVICE_NETMASK="<NKS_SERVICE_NETMASK>"
+OPENVPN_SERVER_IP="<OPENVPN_SERVER_PRIVATE_IP>"
+OPENVPN_SERVER_PORT="<OPENVPN_SERVER_PORT>"
+OPENVPN_PROTO="<OPENVPN_PROTO>"
+EGRESS_DNS_1="<APPROVED_DNS_1>"
+EGRESS_DNS_2="<APPROVED_DNS_2>"
+PRIVATE_DNS_SERVER="<PRIVATE_DNS_SERVER>"
+RUNTIME_BUNDLE="node-runtime-ubuntu2204-amd64.tar.gz"
 
-while read -r pkg; do
-  if apt-cache show "$pkg" 2>/dev/null | grep -q '^Filename: '; then
-    echo "$pkg"
-  fi
-done < pkglist.raw > pkglist.txt
+sudo install -d -m 0755 /opt/ovpn-bootstrap
+sudo install -d -m 0755 /root/pkg/node-runtime
+sudo install -d -m 0755 /etc/openvpn/client
+sudo install -d -m 0700 /etc/openvpn/client/pki
 
-xargs -a pkglist.txt sudo apt-get install --download-only --reinstall -y \
-  -o Dir::Cache::archives="$(pwd)/"
+curl -k -fsSL -u "${BOOTSTRAP_USER}:${BOOTSTRAP_PASSWORD}" \
+  -o "${BOOTSTRAP_CA}" \
+  "${BOOTSTRAP_BASE_URL}/packages/bootstrap-root-ca.pem"
+sudo chmod 0644 "${BOOTSTRAP_CA}"
 
-tar czf ../node-runtime-ubuntu2204-amd64.tar.gz ./*.deb
+curl -fsSL --cacert "${BOOTSTRAP_CA}" -u "${BOOTSTRAP_USER}:${BOOTSTRAP_PASSWORD}" \
+  -o /opt/ovpn-bootstrap/${RUNTIME_BUNDLE} \
+  "${BOOTSTRAP_BASE_URL}/packages/${RUNTIME_BUNDLE}"
 
-## worker node
-sudo install -d -m 0750 /root/pkg/node-runtime
-sudo tar xzf node-runtime-ubuntu2204-amd64.tar.gz -C /root/pkg/node-runtime
+sudo tar xzf /opt/ovpn-bootstrap/${RUNTIME_BUNDLE} -C /root/pkg/node-runtime
 sudo bash -lc 'dpkg -i /root/pkg/node-runtime/*.deb || true'
-sudo bash -lc 'DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::archives=/root/pkg/node-runtime --no-download -f install -y'
+sudo bash -lc 'DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::archives=/root/pkg/node-runtime --no-download -f install -y || true'
 
-sudo install -d -m 0750 /etc/openvpn/client/pki
-sudo cp ./ca.crt /etc/openvpn/client/pki/
-sudo cp ./client.crt /etc/openvpn/client/pki/
-sudo cp ./client.key /etc/openvpn/client/pki/
-sudo cp ./tls-crypt.key /etc/openvpn/client/pki/
+cat >/opt/ovpn-bootstrap/node-bundle-request.json <<EOF
+{
+  "node_id": "${NODE_ID}",
+  "node_group": "${NODE_GROUP}",
+  "role": "${NODE_ROLE}",
+  "cluster": "${CLUSTER_NAME}",
+  "metadata": {
+    "instance_id": "${METADATA_INSTANCE_ID}",
+    "local_hostname": "${METADATA_LOCAL_HOSTNAME}",
+    "private_ip": "${METADATA_PRIVATE_IP}"
+  }
+}
+EOF
 
-sudo tee /etc/openvpn/client/worker-egress.conf >/dev/null <<'EOF'
+curl -fsS --cacert "${BOOTSTRAP_CA}" -X POST "${ISSUER_TOKEN_URL}" \
+  -u "${BOOTSTRAP_USER}:${BOOTSTRAP_PASSWORD}" \
+  -H "Content-Type: application/json" \
+  --data @/opt/ovpn-bootstrap/node-bundle-request.json \
+  -o /opt/ovpn-bootstrap/node-token-response.json
+
+NODE_TOKEN="$(
+  python3 - <<'PY' /opt/ovpn-bootstrap/node-token-response.json
+import json, sys
+print(json.load(open(sys.argv[1], encoding='utf-8'))['token'])
+PY
+)"
+
+curl -fsS --cacert "${BOOTSTRAP_CA}" -X POST "${ISSUER_BUNDLE_URL}" \
+  -H "Authorization: Bearer ${NODE_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data @/opt/ovpn-bootstrap/node-bundle-request.json \
+  -o /opt/ovpn-bootstrap/${NODE_ID}.tar.gz
+
+sudo tar xzf /opt/ovpn-bootstrap/${NODE_ID}.tar.gz -C /etc/openvpn/client/pki
+sudo chmod 0644 /etc/openvpn/client/pki/ca.crt
+sudo chmod 0644 /etc/openvpn/client/pki/client.crt
+sudo chmod 0600 /etc/openvpn/client/pki/client.key
+sudo chmod 0600 /etc/openvpn/client/pki/tls-crypt.key
+
+sudo tee /etc/openvpn/client/worker-egress.conf >/dev/null <<EOF
 client
 dev tun
-proto <OPENVPN_PROTO>
-remote <OPENVPN_SERVER_PRIVATE_IP> <OPENVPN_SERVER_PORT>
+proto ${OPENVPN_PROTO}
+remote ${OPENVPN_SERVER_IP} ${OPENVPN_SERVER_PORT}
 nobind
 persist-key
 persist-tun
@@ -1568,24 +1810,30 @@ data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
 verb 3
 
 route-nopull
-route <OPENVPN_SERVER_PRIVATE_IP> 255.255.255.255 net_gateway
-route <PRIVATE_VPC_NETWORK> <PRIVATE_VPC_NETMASK> net_gateway
-route <PUBLIC_VPC_NETWORK> <PUBLIC_VPC_NETMASK> net_gateway
-route <NKS_POD_NETWORK> <NKS_POD_NETMASK> net_gateway
-route <NKS_SERVICE_NETWORK> <NKS_SERVICE_NETMASK> net_gateway
+route ${OPENVPN_SERVER_IP} 255.255.255.255 net_gateway
+route ${PRIVATE_VPC_NETWORK} ${PRIVATE_VPC_NETMASK} net_gateway
+route ${PUBLIC_VPC_NETWORK} ${PUBLIC_VPC_NETMASK} net_gateway
+route ${NKS_POD_NETWORK} ${NKS_POD_NETMASK} net_gateway
+route ${NKS_SERVICE_NETWORK} ${NKS_SERVICE_NETMASK} net_gateway
 route 0.0.0.0 128.0.0.0 vpn_gateway
 route 128.0.0.0 128.0.0.0 vpn_gateway
-route <SERVICE_GATEWAY_IP_1> 255.255.255.255 <SERVICE_GATEWAY_NEXT_HOP>
-route <SERVICE_GATEWAY_IP_2> 255.255.255.255 <SERVICE_GATEWAY_NEXT_HOP>
 EOF
 
 sudo systemctl enable --now openvpn-client@worker-egress
-sudo systemctl status openvpn-client@worker-egress
 
-sudo resolvectl dns tun0 <APPROVED_DNS_1> <APPROVED_DNS_2>
+sudo resolvectl dns eth0 "${PRIVATE_DNS_SERVER}"
+sudo resolvectl domain eth0 '~openstacklocal' '~container.nhncloud.com' '~nhncloudservice.com'
+sudo resolvectl dns tun0 "${EGRESS_DNS_1}" "${EGRESS_DNS_2}"
 sudo resolvectl domain tun0 '~.'
 sudo resolvectl flush-caches
 ```
+
+메모:
+
+- 현재 `NKS worker 표준`을 그대로 재현하는 목적이면 `7.5.1`과 같은 `split DNS`까지 같이 적용한다.
+- 단순히 `node curl google.com`만 확인하는 일반 OpenVPN client 검증이라면 `tun0` 쪽 DNS만으로도 충분할 수 있다.
+- 하지만 현재 과업은 `Private URI image pull`, `test Pod 생성`, `pod curl https://www.google.com`까지 함께 보는 흐름이므로, 수동 설치도 결국 `7.5`와 같은 `split DNS` 기준으로 보는 편이 맞다.
+- 실환경 값은 `7.5.2`의 `실환경 예시`와 동일한 값을 채우면 된다.
 
 노드 egress 검증:
 
@@ -1607,105 +1855,7 @@ curl https://ifconfig.me
 - `curl -I https://www.google.com`과 `curl https://ifconfig.me`가 성공하면 `node outbound`가 OpenVPN 경유로 나가는 상태로 본다.
 - 이 단계가 끝난 뒤에만 `pod`에서 `nslookup google.com`, `curl -I https://www.google.com`을 본다.
 
-### 7.7 DaemonSet 자동 설치 방안 검토
-
-결론부터 말하면 `가능은 하지만 운영 권장안은 아니다`.
-
-이 방식이 성립하려면 DaemonSet Pod가 아래 조건을 만족해야 한다.
-
-- `hostNetwork: true`
-- `privileged: true`
-- `NET_ADMIN`
-- `/dev/net/tun` 접근
-- host의 `/etc/openvpn` 또는 대응 디렉터리 수정 권한
-- host route 및 systemd service를 건드릴 수 있는 권한
-
-실무에서는 보통 아래 둘 중 하나로 구현한다.
-
-1. `nsenter`로 host namespace에 들어가 host에 OpenVPN client를 설치/재기동
-2. Pod 자체를 host network에서 띄우고 host route를 직접 조작
-
-예시 개념 명령:
-
-```bash
-nsenter --target 1 --mount --uts --ipc --net --pid -- bash -lc '
-  install -d -m 0750 /etc/openvpn/client/pki
-  cp /bundle/* /etc/openvpn/client/pki/
-  systemctl restart openvpn-client@worker-egress
-'
-```
-
-최소 실험용 DaemonSet 예시:
-
-```yaml
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: ovpn-host-installer
-  namespace: kube-system
-spec:
-  selector:
-    matchLabels:
-      app: ovpn-host-installer
-  template:
-    metadata:
-      labels:
-        app: ovpn-host-installer
-    spec:
-      hostNetwork: true
-      hostPID: true
-      imagePullSecrets:
-        - name: regcred
-      tolerations:
-        - operator: Exists
-      volumes:
-        - name: host-root
-          hostPath:
-            path: /
-            type: Directory
-        - name: bundle
-          secret:
-            secretName: ovpn-node-bundle
-      containers:
-        - name: installer
-          image: registry.internal/platform/openvpn-installer:22.04
-          securityContext:
-            privileged: true
-          command:
-            - /bin/bash
-            - -lc
-            - |
-              nsenter --target 1 --mount --uts --ipc --net --pid -- bash -lc '
-                install -d -m 0750 /etc/openvpn/client/pki
-                cp /bundle/* /etc/openvpn/client/pki/
-                systemctl restart openvpn-client@worker-egress
-              '
-              sleep infinity
-          volumeMounts:
-            - name: host-root
-              mountPath: /host
-            - name: bundle
-              mountPath: /bundle
-              readOnly: true
-```
-
-주의:
-
-- 이 예시는 `설치 자동화가 technically possible`함을 보여주기 위한 실험용이다.
-- 위 installer 이미지는 `인터넷이 되는 외부 빌드 환경`에서 `openvpn`, `util-linux`를 포함해 미리 빌드하고 내부 레지스트리에 넣어둔 것을 전제로 한다.
-- 실제 운영용 manifest로 바로 쓰기엔 package install, host drift, PodSecurity 예외가 너무 크다.
-- registry가 인증을 요구하면 `imagePullSecrets`를 같이 넣어야 한다.
-
-비권장 이유:
-
-- host image/package manager 차이에 민감함
-- PodSecurity 예외가 큼
-- node upgrade 시 drift 관리가 어려움
-- 결국 `NKS user script`보다 복잡하다
-
-따라서 DaemonSet은 `설치 자동화 실험용` 정도로만 보고, 운영 기준은 `User Script`를 권장한다.
-
-### 7.8 검증
+### 7.7 검증
 
 worker node에서:
 
@@ -1724,10 +1874,10 @@ kubectl exec -it <pod> -- curl -4 https://ifconfig.me
 kubectl exec -it <pod> -- curl -I https://www.google.com
 ```
 
-### 7.9 운영 팁
+### 7.8 운영 팁
 
 - 반드시 `전용 node group`으로 격리한다.
-- cluster autoscaler를 쓴다면 신규 node도 같은 bundle fetch 규칙을 따라야 한다.
+- cluster autoscaler를 쓴다면 신규 node도 같은 `node-token -> node-bundle` 규칙을 따라야 한다.
 - node certificate는 `hostname 종속` 대신 `nodegroup-role-random` 방식이 배포 자동화에는 더 낫다.
 
 
@@ -1796,13 +1946,74 @@ sudo bash -lc 'DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::archives=/r
 sudo install -d -m 0750 /etc/openvpn/client/pki
 ```
 
-클라이언트 번들 복사:
+Gateway VM bundle 수령 방식:
+
+현재 worker와 동일한 `token -> bundle` 2단계 패턴을 gateway identity로 확장한 템플릿이다.
+
+템플릿:
+
+```bash
+ISSUER_TOKEN_URL="https://<ISSUER_API_PRIVATE_IP>:8443/v1/bootstrap/gateway-token"
+ISSUER_BUNDLE_URL="https://<ISSUER_API_PRIVATE_IP>:8443/v1/bootstrap/gateway-bundle"
+ISSUER_CACERT="/etc/ssl/certs/bootstrap-root-ca.pem"
+BOOTSTRAP_USER="<BOOTSTRAP_USER>"
+BOOTSTRAP_PASSWORD="<BOOTSTRAP_PASSWORD>"
+GATEWAY_ID="${GATEWAY_ID_OVERRIDE:-$(hostname -s)}"
+GATEWAY_GROUP="<GATEWAY_GROUP>"
+CLUSTER_NAME="<CLUSTER_NAME>"
+INSTANCE_ID="$(cat /var/lib/cloud/data/instance-id 2>/dev/null || hostname -s)"
+LOCAL_HOSTNAME="$(hostname -s)"
+PRIVATE_IP="$(hostname -I | awk '{print $1}')"
+
+cat >/root/gateway-bundle-request.json <<EOF
+{
+  "gateway_id": "${GATEWAY_ID}",
+  "gateway_group": "${GATEWAY_GROUP}",
+  "role": "gateway",
+  "cluster": "${CLUSTER_NAME}",
+  "metadata": {
+    "instance_id": "${INSTANCE_ID}",
+    "local_hostname": "${LOCAL_HOSTNAME}",
+    "private_ip": "${PRIVATE_IP}"
+  }
+}
+EOF
+
+curl -fsS --cacert "${ISSUER_CACERT}" -X POST "${ISSUER_TOKEN_URL}" \
+  -u "${BOOTSTRAP_USER}:${BOOTSTRAP_PASSWORD}" \
+  -H "Content-Type: application/json" \
+  --data @/root/gateway-bundle-request.json \
+  -o /root/gateway-token-response.json
+
+GATEWAY_TOKEN="$(
+  python3 - <<'PY' /root/gateway-token-response.json
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["token"])
+PY
+)"
+
+curl -fsS --cacert "${ISSUER_CACERT}" -X POST "${ISSUER_BUNDLE_URL}" \
+  -H "Authorization: Bearer ${GATEWAY_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data @/root/gateway-bundle-request.json \
+  -o /root/${GATEWAY_ID}.tar.gz
+
+sudo tar xzf /root/${GATEWAY_ID}.tar.gz -C /etc/openvpn/client/pki
+```
+
+PoC 또는 fallback 수동 방식:
 
 ```bash
 sudo cp ~/dist/ovpn-gw-pri-01/* /etc/openvpn/client/pki/
 sudo chmod 0644 /etc/openvpn/client/pki/ca.crt /etc/openvpn/client/pki/*.crt
 sudo chmod 0600 /etc/openvpn/client/pki/*.key
 ```
+
+메모:
+
+- 현재 `ta-sgh-ca`에는 `worker node` endpoint만 실제 구현돼 있다.
+- `gateway VM`에 full-auto를 적용하려면 위와 같은 요청 형식으로 `/v1/bootstrap/gateway-token`, `/v1/bootstrap/gateway-bundle`를 같은 패턴으로 추가하면 된다.
+- 따라서 현재는 `템플릿`만 제공하고, `실환경 예시`는 아직 없다.
 
 ### 8.4 Gateway VM client 설정
 
@@ -1971,12 +2182,72 @@ exec openvpn --config /etc/openvpn/client/client.conf
 
 ### 9.4 Kubernetes Secret
 
+sidecar도 worker와 같은 `token -> bundle` 2단계 패턴으로 full-auto화할 수 있다. 다만 현재는 실제 구현 전이므로, 아래에는 fallback 수동 방식과 확장용 템플릿을 같이 둔다.
+
+PoC 또는 fallback 수동 방식:
+
 ```bash
-kubectl -n app-ns create secret generic ovpn-client-bundle \
-  --from-file=ca.crt=./ca.crt \
-  --from-file=client.crt=./client.crt \
-  --from-file=client.key=./client.key \
-  --from-file=tls-crypt.key=./tls-crypt.key
+bash ~/easy-rsa/scripts/issue-client-bundle.sh ovpn-pod-ns1-app1-01 pod
+
+kubectl -n app-ns create secret generic ovpn-client-bundle-app1 \
+  --from-file=ca.crt="$HOME/dist/pods/ovpn-pod-ns1-app1-01/ca.crt" \
+  --from-file=client.crt="$HOME/dist/pods/ovpn-pod-ns1-app1-01/client.crt" \
+  --from-file=client.key="$HOME/dist/pods/ovpn-pod-ns1-app1-01/client.key" \
+  --from-file=tls-crypt.key="$HOME/dist/pods/ovpn-pod-ns1-app1-01/tls-crypt.key"
+```
+
+템플릿:
+
+```bash
+ISSUER_TOKEN_URL="https://<ISSUER_API_PRIVATE_IP>:8443/v1/bootstrap/workload-token"
+ISSUER_BUNDLE_URL="https://<ISSUER_API_PRIVATE_IP>:8443/v1/bootstrap/workload-bundle"
+ISSUER_CACERT="/etc/ssl/certs/bootstrap-root-ca.pem"
+
+cat >/tmp/workload-bundle-request.json <<'EOF'
+{
+  "namespace": "<APP_NAMESPACE>",
+  "workload": "<WORKLOAD_NAME>",
+  "type": "deployment",
+  "bundle_scope": "workload",
+  "cluster": "<CLUSTER_NAME>"
+}
+EOF
+
+curl -fsS --cacert "${ISSUER_CACERT}" -X POST "${ISSUER_TOKEN_URL}" \
+  -H "Authorization: Bearer <CI_OR_CONTROLLER_BOOTSTRAP_TOKEN>" \
+  -H "Content-Type: application/json" \
+  --data @/tmp/workload-bundle-request.json \
+  -o /tmp/workload-token-response.json
+
+WORKLOAD_TOKEN="$(
+  python3 - <<'PY' /tmp/workload-token-response.json
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["token"])
+PY
+)"
+
+curl -fsS --cacert "${ISSUER_CACERT}" -X POST "${ISSUER_BUNDLE_URL}" \
+  -H "Authorization: Bearer ${WORKLOAD_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data @/tmp/workload-bundle-request.json \
+  -o /tmp/workload-bundle.json
+
+python3 - <<'PY'
+import base64, json, pathlib
+data = json.load(open("/tmp/workload-bundle.json", encoding="utf-8"))
+out = pathlib.Path("/tmp/ovpn-workload-bundle")
+out.mkdir(exist_ok=True)
+for name, content in data["files"].items():
+    (out / name).write_bytes(base64.b64decode(content))
+PY
+
+kubectl -n <APP_NAMESPACE> delete secret ovpn-client-bundle --ignore-not-found
+kubectl -n <APP_NAMESPACE> create secret generic ovpn-client-bundle \
+  --from-file=ca.crt=/tmp/ovpn-workload-bundle/ca.crt \
+  --from-file=client.crt=/tmp/ovpn-workload-bundle/client.crt \
+  --from-file=client.key=/tmp/ovpn-workload-bundle/client.key \
+  --from-file=tls-crypt.key=/tmp/ovpn-workload-bundle/tls-crypt.key
+kubectl -n <APP_NAMESPACE> rollout restart deployment/<WORKLOAD_NAME>
 ```
 
 메모:
@@ -1984,6 +2255,10 @@ kubectl -n app-ns create secret generic ovpn-client-bundle \
 - `NKS Secure Key Manager` 연동을 쓰면 이 Secret은 `etcd 저장 시점`의 암호화에는 도움 된다.
 - 하지만 sidecar가 mount 받은 뒤에는 일반 파일처럼 보이므로, runtime secret 노출면을 줄이려면 Pod 권한과 Secret 접근 범위를 별도로 통제해야 한다.
 - 즉 `SKM`은 `OpenVPN CA` 대체재가 아니라 `Kubernetes Secret at-rest 보호` 수단으로 이해하는 편이 맞다.
+- 현재 `ta-sgh-ca`에는 `workload` endpoint가 아직 실제 구현돼 있지 않다.
+- sidecar full-auto를 쓰려면 위와 같은 2단계 흐름으로 `/v1/bootstrap/workload-token`, `/v1/bootstrap/workload-bundle`를 같은 패턴으로 추가하면 된다.
+- sidecar는 Pod가 직접 발급 API를 두드리게 하기보다 `CI` 또는 `cluster 내부 controller`가 Secret을 갱신하는 편이 안전하다.
+- 따라서 현재는 `템플릿`만 제공하고, `실환경 예시`는 아직 없다.
 
 ### 9.5 sidecar client 설정
 

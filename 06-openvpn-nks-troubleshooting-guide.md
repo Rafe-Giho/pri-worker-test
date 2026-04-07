@@ -1,10 +1,27 @@
-# NKS OpenVPN 트러블슈팅 가이드
+# 06. NKS OpenVPN 트러블슈팅 가이드
 
-- 이 문서는 [openvpn-nks-build-guide.md](./openvpn-nks-build-guide.md)의 트러블슈팅 부록이다.
+- 이 문서는 [01-openvpn-nks-build-guide.md](./01-openvpn-nks-build-guide.md)의 트러블슈팅 부록이다.
 - `NodeGroup-A / user script / worker-egress` 기준 원인 분리를 먼저 정리하고, 필요 시 gateway VM / sidecar로 확장한다.
 - 현재 운영 기본값은 `split DNS`다.
   - `eth0 -> Private DNS`: `openstacklocal`, `container.nhncloud.com`, `nhncloudservice.com`
   - `tun0 -> 외부 DNS`: 그 외 public name
+
+현재 기준 우선 점검 대상:
+
+- 운영 표준
+  - `NodeGroup-A`
+  - `Basic Auth -> node-token -> node-bundle`
+  - `openvpn-client@worker-egress`
+- 확장 방식
+  - `Gateway VM`
+  - `Pod sidecar`
+  - 위 둘은 이 문서에서 공통 원인 분리 순서만 참고하고, 실제 구현 차이는 별도 문서에서 본다
+
+표기 원칙:
+
+- 이 문서는 `실환경 예시`보다 `원인 분리 순서`를 우선한다
+- 명령 예시는 가능한 공통형으로 유지하고, 특정 값이 필요한 경우 placeholder를 쓴다
+- 실환경 값이 필요하면 [07-openvpn-nks-test-guide.md](./07-openvpn-nks-test-guide.md)의 예시를 참고한다
 
 ## 1. 먼저 보는 순서
 
@@ -12,7 +29,7 @@
 
 1. `user script`가 실제로 들어갔는지
 2. bootstrap 서버에서 2차 스크립트를 받았는지
-3. runtime / client bundle 배치가 끝났는지
+3. runtime / Issuer API bundle 발급이 끝났는지
 4. `openvpn-client@worker-egress`가 떴는지
 5. `tun0`와 node egress가 되는지
 6. `Private URI` image pull이 되는지
@@ -21,6 +38,14 @@
 `node 성공 == pod 성공`으로 보면 안 된다.
 
 ## 2. User Script / Bootstrap 문제
+
+가장 먼저 확인할 공통 파일:
+
+```bash
+sudo wc -c /var/tmp/userscript.sh /var/tmp/userscript_v2.sh 2>/dev/null
+ls -l /var/tmp/worker-egress-bootstrap.sh 2>/dev/null
+sudo tail -n 100 /var/log/ovpn-user-script.log
+```
 
 확인:
 
@@ -40,12 +65,33 @@ sudo tail -n 100 /var/log/ovpn-user-script.log
   - bootstrap 서버 접근, Basic Auth, nginx 문제
 - `required runtime packages are still missing...`
   - 2차 runtime 설치 단계 실패
+- `403 invalid bootstrap credentials`, `403 local_hostname mismatch`, `403 private_ip mismatch`
+  - `Issuer API node-token` 단계에서 bootstrap credential 또는 metadata 값 불일치 가능성이 높다
+- `403 invalid token`, `403 subject mismatch`, `403 metadata mismatch`, `409 token already used`
+  - `Issuer API node-bundle` 단계에서 1회성 token 또는 metadata 값 불일치 가능성이 높다
 
 bootstrap 서버 실제 파일도 같이 본다.
 
 ```bash
-sudo grep -nE 'PRIVATE_DNS_SERVER|resolvectl dns eth0|have_runtime_pkgs' /srv/bootstrap/ovpn/packages/worker-egress-bootstrap.sh
+sudo grep -nE 'ISSUER_TOKEN_URL|ISSUER_BUNDLE_URL|METADATA_INSTANCE_ID|PRIVATE_DNS_SERVER|resolvectl dns eth0|have_runtime_pkgs' /srv/bootstrap/ovpn/packages/worker-egress-bootstrap.sh
 ```
+
+템플릿 관점에서 최소 확인해야 할 값:
+
+- 1차 launcher
+  - `BOOTSTRAP_IP`
+  - `BOOTSTRAP_USER`
+  - `BOOTSTRAP_PASSWORD`
+  - `NODE_GROUP`
+  - `CLUSTER_NAME`
+  - `OPENVPN_SERVER_IP`
+  - `PRIVATE_DNS_SERVER`
+- 2차 bootstrap script
+  - `ISSUER_TOKEN_URL`
+  - `ISSUER_BUNDLE_URL`
+  - `have_runtime_pkgs`
+  - `resolvectl dns eth0`
+  - `resolvectl dns tun0`
 
 ## 3. 연결 자체가 안 될 때
 
@@ -116,23 +162,36 @@ resolvectl query www.google.com
 
 ```bash
 resolvectl status
-sudo grep -nE 'PRIVATE_DNS_SERVER|PRIVATE_DNS_ROUTE_DOMAINS' /var/tmp/userscript_v2.sh
-sudo grep -nE 'PRIVATE_DNS_SERVER|PRIVATE_DNS_ROUTE_DOMAINS|resolvectl dns eth0|resolvectl domain eth0' /var/tmp/worker-egress-bootstrap.sh
-sudo grep -nE 'PRIVATE_DNS_SERVER|resolvectl dns eth0|resolvectl domain eth0' /var/log/ovpn-user-script.log
+sudo grep -nE 'BOOTSTRAP_USER|BOOTSTRAP_PASSWORD|METADATA_INSTANCE_ID|METADATA_LOCAL_HOSTNAME|METADATA_PRIVATE_IP|PRIVATE_DNS_SERVER|PRIVATE_DNS_ROUTE_DOMAINS' /var/tmp/userscript_v2.sh
+sudo grep -nE 'ISSUER_TOKEN_URL|ISSUER_BUNDLE_URL|METADATA_INSTANCE_ID|PRIVATE_DNS_SERVER|PRIVATE_DNS_ROUTE_DOMAINS|resolvectl dns eth0|resolvectl domain eth0' /var/tmp/worker-egress-bootstrap.sh
+sudo grep -nE 'invalid bootstrap credentials|local_hostname mismatch|private_ip mismatch|metadata mismatch|token already used|PRIVATE_DNS_SERVER|resolvectl dns eth0|resolvectl domain eth0' /var/log/ovpn-user-script.log
 ```
 
 판단:
 
 - `PRIVATE_DNS_SERVER`가 1차 launcher에 없음
   - node group user script가 예전 버전
+- `BOOTSTRAP_USER`, `BOOTSTRAP_PASSWORD`, metadata 값이 1차 launcher에 없음
+  - Issuer API 완전 자동 발급 launcher가 아닌 예전 버전
 - `worker-egress-bootstrap.sh`에 `resolvectl dns eth0`가 없음
   - bootstrap 서버 2차 파일이 예전 버전
+- `worker-egress-bootstrap.sh`에 `ISSUER_TOKEN_URL`, `ISSUER_BUNDLE_URL`이 없음
+  - bootstrap 서버 2차 파일이 예전 반자동 또는 정적 bundle 버전
 - 둘 다 있는데 `private-...`가 계속 `link: tun0`
   - `Private DNS zone / VPC 연결` 문제 가능성이 높다
 
 `/etc/resolv.conf`는 직접 수정하지 않는다.
 
 ## 6. Private NKS + Private URI image pull이 안 될 때
+
+이 구간은 `OpenVPN 문제`와 `Private NCR/OBS name resolution 문제`를 섞지 말고 본다.
+
+먼저 확인할 전제:
+
+- `Private DNS`
+- `NCR SGW`
+- `OBS SGW`
+- `imagePullSecret`
 
 먼저 node에서:
 
@@ -190,6 +249,8 @@ kubectl get pod -A -o wide
 - Pod 간 통신 실패
 
 ## 8. Pod DNS / Pod HTTP가 안 될 때
+
+이 구간은 항상 `node 성공 이후`에 본다.
 
 순서:
 

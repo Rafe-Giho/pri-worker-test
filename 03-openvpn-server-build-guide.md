@@ -1,6 +1,11 @@
-# OpenVPN Server 상세 구축 가이드
+# 03. OpenVPN Server 상세 구축 가이드
 
 이 문서는 `Public VPC OpenVPN Server VM` 기준 상세 서버 구축 가이드다. 목적은 아래 두 가지다.
+
+표기 원칙:
+
+- `템플릿`: 포트, 대역, 파일명 등을 일반화한 예시
+- `실환경 예시`: 현재 `ta-sgh-ovpn` 검증값
 
 - `Private VPC NKS`의 client가 `OpenVPN Server`에 붙을 수 있게 한다
 - 붙은 client의 외부 인터넷 통신을 `OpenVPN Server -> Internet Gateway`로 내보낸다
@@ -93,7 +98,7 @@ sudo install -d -m 0755 /var/log/openvpn
 메모:
 
 - 이번 아키텍처에서는 `OpenVPN Server`만 public outbound가 가능하다고 가정하므로, 이 서버에 대해서만 온라인 `apt-get` 예시를 유지한다.
-- `CA / Bootstrap Server`, `Issuer API 역할`, `worker node`, `VPN Gateway VM`은 비인터넷 구간이므로 [openvpn-nks-implementation-appendix.md](./openvpn-nks-implementation-appendix.md)의 `4.3 비인터넷 구간 패키지 설치 원칙`을 따른다.
+- `CA / Bootstrap Server`, `Issuer API 역할`, `worker node`, `VPN Gateway VM`은 비인터넷 구간이므로 [02-openvpn-nks-implementation-appendix.md](./02-openvpn-nks-implementation-appendix.md)의 `4.3 비인터넷 구간 패키지 설치 원칙`을 따른다.
 - 기본 이미지에 `iptables` 명령 자체가 이미 들어 있는 경우가 많다.
 - 여기서 `iptables-persistent`를 같이 설치하는 이유는 명령 제공보다 `재부팅 후 규칙 영속화`에 가깝다.
 - 이미 `nftables`, `iptables-restore`, `cloud-init`, 별도 구성관리 도구로 규칙 영속화를 처리한다면 이 패키지는 생략할 수 있다.
