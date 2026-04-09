@@ -13,7 +13,7 @@ spec:
     - name: registry-credential
   containers:
     - name: test
-      image: private-c0978417-kr1-registry.container.nhncloud.com/ta-sgh-ncr/pod-egress-test:1.0.0
+      image: private-c0978417-kr1-registry.container.nhncloud.com/ta-sgh-ncr/pod-egress-test:1.0.1
       imagePullPolicy: Always
       command: ["sh", "-c", "sleep 365d"]
   restartPolicy: Never
