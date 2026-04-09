@@ -6,6 +6,7 @@ RUN apk add --no-cache \
     ca-certificates \
     curl \
     iproute2 \
-    iputils
+    iputils \
+    tcpdump
 
 CMD ["sh", "-c", "trap : TERM INT; sleep 365d & wait"]
